@@ -37,6 +37,7 @@ install(DIRECTORY
   rviz
   srdf
   launch
+  isaac
   DESTINATION share/${PROJECT_NAME}/
 )
 
