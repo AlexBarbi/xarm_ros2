@@ -150,6 +150,9 @@ def launch_setup(context, *args, **kwargs):
     isaac_headless = LaunchConfiguration('isaac_headless', default=False).perform(context) in ('True', 'true')
     isaac_livestream = LaunchConfiguration('isaac_livestream', default=False).perform(context) in ('True', 'true')
     isaac_table = LaunchConfiguration('isaac_table', default=True).perform(context) in ('True', 'true')
+    # RealSense color/depth from Isaac Sim (needs add_realsense_d435i), the point cloud is heavy, off by default
+    isaac_camera = LaunchConfiguration('isaac_camera', default=True).perform(context) in ('True', 'true')
+    isaac_camera_pointcloud = LaunchConfiguration('isaac_camera_pointcloud', default=False).perform(context) in ('True', 'true')
     # Isaac Sim container, e.g. nvcr.io/nvidia/isaac-sim:5.1.0, takes precedence over isaac_sim_path
     isaac_docker_image = LaunchConfiguration('isaac_docker_image', default='').perform(context)
     isaac_docker_args = LaunchConfiguration('isaac_docker_args', default='').perform(context)
@@ -286,6 +289,12 @@ def launch_setup(context, *args, **kwargs):
         isaac_flags.append('--livestream')
     if not isaac_table:
         isaac_flags.append('--no-table')
+    if isaac_camera and add_realsense_d435i.perform(context) in ('True', 'true'):
+        isaac_flags += ['--camera-frame', '{}camera_color_optical_frame'.format(prefix.perform(context))]
+        if isaac_camera_pointcloud:
+            isaac_flags.append('--camera-pointcloud')
+    else:
+        isaac_flags.append('--no-camera')
     host_cmd = [
         os.path.join(isaac_bundle_dir, ISAAC_SCRIPT), '--urdf', os.path.abspath(isaac_urdf_path)
     ] + isaac_flags

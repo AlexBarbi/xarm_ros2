@@ -4,8 +4,8 @@
 # xarm5 + MoveIt in Isaac Sim (Isaac Sim replacement for xarm5_moveit_gazebo.launch.py).
 # Start Isaac Sim too with isaac_sim_path:=<isaac_sim dir> (or $ISAAC_SIM_PATH),
 # or in a container with isaac_docker_image:=nvcr.io/nvidia/isaac-sim:<version> [isaac_docker_args:='-v ...'].
-# Other args: isaac_headless, isaac_livestream, isaac_table, isaac_urdf_path, isaac_ros_distro,
-# use_sim_time, show_rviz.
+# Other args: isaac_headless, isaac_livestream, isaac_table, isaac_camera, isaac_camera_pointcloud,
+# isaac_urdf_path, isaac_ros_distro, use_sim_time, show_rviz.
 
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription

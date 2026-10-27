@@ -12,10 +12,15 @@
 # imports the URDF written by the launch file and wires a ROS 2 action graph:
 #   Isaac -> ROS 2: /clock, /isaac_joint_states
 #   ROS 2 -> Isaac: /isaac_joint_commands (position + velocity targets from topic_based_ros2_control)
+#   RealSense (camera at the URDF camera_color_optical_frame, topics of the Gazebo plugin):
+#     /camera/color/image_raw, /camera/color/camera_info, /camera/aligned_depth_to_color/image_raw,
+#     /camera/depth/camera_info, optionally /camera/depth/color/points
 
 import argparse
+import math
 import os
 import tempfile
+import xml.etree.ElementTree as ET
 
 parser = argparse.ArgumentParser(description='xArm scene for MoveIt in Isaac Sim')
 parser.add_argument('--urdf', required=True, help='URDF written by _robot_moveit_isaac.launch.py')
@@ -29,6 +34,13 @@ parser.add_argument('--render-hz', type=int, default=60, help='app loop rate lim
 # USD angular drive units are per degree: 1047.2 Nm/deg = 6e4 Nm/rad, 52.36 Nms/deg = 3e3 Nms/rad
 parser.add_argument('--stiffness', type=float, default=1047.2, help='joint drive stiffness (per degree)')
 parser.add_argument('--damping', type=float, default=52.36, help='joint drive damping (per degree)')
+parser.add_argument('--no-camera', action='store_true', help='no RealSense color/depth publishing')
+parser.add_argument('--camera-frame', default='camera_color_optical_frame', help='URDF link of the camera optical frame')
+parser.add_argument('--camera-pointcloud', action='store_true', help='also publish the depth point cloud (heavy)')
+parser.add_argument('--camera-width', type=int, default=640)
+parser.add_argument('--camera-height', type=int, default=480)
+parser.add_argument('--camera-hfov', type=float, default=69.4, help='horizontal field of view in degrees (D435i color)')
+parser.add_argument('--camera-hz', type=float, default=30.0, help='publish rate, rounded to a whole divisor of --render-hz')
 args, _ = parser.parse_known_args()
 
 # SimulationApp must be created before any omni / pxr import
@@ -41,12 +53,13 @@ if args.livestream:
 simulation_app = SimulationApp(app_config)
 
 import carb
+import numpy as np
 import omni.graph.core as og
 import omni.kit.app
 import omni.kit.commands
 import omni.timeline
 import omni.usd
-from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
 
 def enable_first(*names):
@@ -210,48 +223,126 @@ def tune_joint_drives(stage):
         drive.CreateTargetPositionAttr().Set(0.0)
 
 
+def urdf_origin(joint):
+    # 4x4 transform of a URDF joint origin, rpy as fixed-axis roll, pitch, yaw
+    origin = joint.find('origin')
+    xyz = [float(v) for v in origin.get('xyz', '0 0 0').split()] if origin is not None else [0.0] * 3
+    roll, pitch, yaw = [float(v) for v in origin.get('rpy', '0 0 0').split()] if origin is not None else [0.0] * 3
+    cr, sr, cp, sp, cy, sy = math.cos(roll), math.sin(roll), math.cos(pitch), math.sin(pitch), math.cos(yaw), math.sin(yaw)
+    transform = np.eye(4)
+    transform[:3, :3] = [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                         [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                         [-sp, cp * sr, cp * cr]]
+    transform[:3, 3] = xyz
+    return transform
+
+
+def add_camera(stage, robot_path):
+    # The optical frame is a massless URDF link the importer may merge away: walk up its fixed joints
+    # to the first link simulated as a rigid body and attach the camera there
+    bodies = {prim.GetName(): prim.GetPath().pathString
+              for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_path)) if prim.HasAPI(UsdPhysics.RigidBodyAPI)}
+    joints = {joint.find('child').get('link'): joint for joint in ET.parse(args.urdf).getroot().iter('joint')}
+    link, link_to_frame = args.camera_frame, np.eye(4)
+    while link not in bodies:
+        joint = joints.get(link)
+        if joint is None or joint.get('type') != 'fixed':
+            carb.log_warn('xarm isaac: {} not found on a rigid body, no camera'.format(args.camera_frame))
+            return None
+        link_to_frame = urdf_origin(joint) @ link_to_frame
+        link = joint.find('parent').get('link')
+
+    # USD cameras look along -Z with +Y up, ROS optical frames along +Z with +Y down
+    link_to_camera = link_to_frame @ np.diag([1.0, -1.0, -1.0, 1.0])
+    camera = UsdGeom.Camera.Define(stage, bodies[link] + '/RealSense')
+    # Gf matrices act on row vectors
+    camera.AddTransformOp().Set(Gf.Matrix4d(link_to_camera.T.tolist()))
+    aperture = 20.955
+    camera.CreateHorizontalApertureAttr(aperture)
+    camera.CreateVerticalApertureAttr(aperture * args.camera_height / args.camera_width)
+    camera.CreateFocalLengthAttr(aperture / (2 * math.tan(math.radians(args.camera_hfov) / 2)))
+    # D435i depth range
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.1, 10.0))
+    return camera.GetPath().pathString
+
+
 def set_target(stage, node_path, attr_name, target_path):
     prim = stage.GetPrimAtPath(node_path)
     rel = prim.GetRelationship(attr_name) or prim.CreateRelationship(attr_name)
     rel.SetTargets([Sdf.Path(target_path)])
 
 
-def build_ros2_graph(stage, articulation_root):
+def build_ros2_graph(stage, articulation_root, camera_path):
+    nodes = [
+        ('OnPlaybackTick', 'omni.graph.action.OnPlaybackTick'),
+        ('Context', ROS2_NODES + '.ROS2Context'),
+        ('SimTime', CORE_NODES + '.IsaacReadSimulationTime'),
+        ('PublishClock', ROS2_NODES + '.ROS2PublishClock'),
+        ('PublishJointState', ROS2_NODES + '.ROS2PublishJointState'),
+        ('SubscribeJointState', ROS2_NODES + '.ROS2SubscribeJointState'),
+        ('ArticulationController', CORE_NODES + '.IsaacArticulationController'),
+    ]
+    connections = [
+        ('OnPlaybackTick.outputs:tick', 'PublishClock.inputs:execIn'),
+        ('OnPlaybackTick.outputs:tick', 'PublishJointState.inputs:execIn'),
+        ('OnPlaybackTick.outputs:tick', 'SubscribeJointState.inputs:execIn'),
+        ('OnPlaybackTick.outputs:tick', 'ArticulationController.inputs:execIn'),
+        ('Context.outputs:context', 'PublishClock.inputs:context'),
+        ('Context.outputs:context', 'PublishJointState.inputs:context'),
+        ('Context.outputs:context', 'SubscribeJointState.inputs:context'),
+        ('SimTime.outputs:simulationTime', 'PublishClock.inputs:timeStamp'),
+        ('SimTime.outputs:simulationTime', 'PublishJointState.inputs:timeStamp'),
+        ('SubscribeJointState.outputs:jointNames', 'ArticulationController.inputs:jointNames'),
+        ('SubscribeJointState.outputs:positionCommand', 'ArticulationController.inputs:positionCommand'),
+        ('SubscribeJointState.outputs:velocityCommand', 'ArticulationController.inputs:velocityCommand'),
+        ('SubscribeJointState.outputs:effortCommand', 'ArticulationController.inputs:effortCommand'),
+    ]
+    values = [
+        ('PublishClock.inputs:topicName', 'clock'),
+        ('PublishJointState.inputs:topicName', args.joint_states_topic),
+        ('SubscribeJointState.inputs:topicName', args.joint_commands_topic),
+    ]
+    if camera_path:
+        # One render product at the color optical frame gives color and depth, so depth is aligned to color.
+        # Topics of the Gazebo plugin, xarm_description/urdf/camera/realsense.gazebo.xacro
+        camera_topics = [  # (node, helper, sensor type, topic)
+            ('ColorImage', 'ROS2CameraHelper', 'rgb', 'camera/color/image_raw'),
+            ('ColorInfo', 'ROS2CameraInfoHelper', None, 'camera/color/camera_info'),
+            ('DepthImage', 'ROS2CameraHelper', 'depth', 'camera/aligned_depth_to_color/image_raw'),
+            ('DepthInfo', 'ROS2CameraInfoHelper', None, 'camera/depth/camera_info'),
+        ]
+        if args.camera_pointcloud:
+            camera_topics.append(('PointCloud', 'ROS2CameraHelper', 'depth_pcl', 'camera/depth/color/points'))
+        # the helpers publish every rendered frame unless told to skip some
+        frame_skip = max(0, round(args.render_hz / args.camera_hz) - 1)
+        nodes.append(('RenderProduct', CORE_NODES + '.IsaacCreateRenderProduct'))
+        connections.append(('OnPlaybackTick.outputs:tick', 'RenderProduct.inputs:execIn'))
+        values += [
+            ('RenderProduct.inputs:width', args.camera_width),
+            ('RenderProduct.inputs:height', args.camera_height),
+        ]
+        for name, helper, sensor_type, topic in camera_topics:
+            nodes.append((name, ROS2_NODES + '.' + helper))
+            connections += [
+                ('RenderProduct.outputs:execOut', name + '.inputs:execIn'),
+                ('RenderProduct.outputs:renderProductPath', name + '.inputs:renderProductPath'),
+                ('Context.outputs:context', name + '.inputs:context'),
+            ]
+            values += [
+                (name + '.inputs:topicName', topic),
+                (name + '.inputs:frameId', args.camera_frame),
+                (name + '.inputs:frameSkipCount', frame_skip),
+            ]
+            if sensor_type:
+                values.append((name + '.inputs:type', sensor_type))
+
     keys = og.Controller.Keys
     og.Controller.edit(
         {'graph_path': '/ActionGraph', 'evaluator_name': 'execution'},
-        {
-            keys.CREATE_NODES: [
-                ('OnPlaybackTick', 'omni.graph.action.OnPlaybackTick'),
-                ('Context', ROS2_NODES + '.ROS2Context'),
-                ('SimTime', CORE_NODES + '.IsaacReadSimulationTime'),
-                ('PublishClock', ROS2_NODES + '.ROS2PublishClock'),
-                ('PublishJointState', ROS2_NODES + '.ROS2PublishJointState'),
-                ('SubscribeJointState', ROS2_NODES + '.ROS2SubscribeJointState'),
-                ('ArticulationController', CORE_NODES + '.IsaacArticulationController'),
-            ],
-            keys.CONNECT: [
-                ('OnPlaybackTick.outputs:tick', 'PublishClock.inputs:execIn'),
-                ('OnPlaybackTick.outputs:tick', 'PublishJointState.inputs:execIn'),
-                ('OnPlaybackTick.outputs:tick', 'SubscribeJointState.inputs:execIn'),
-                ('OnPlaybackTick.outputs:tick', 'ArticulationController.inputs:execIn'),
-                ('Context.outputs:context', 'PublishClock.inputs:context'),
-                ('Context.outputs:context', 'PublishJointState.inputs:context'),
-                ('Context.outputs:context', 'SubscribeJointState.inputs:context'),
-                ('SimTime.outputs:simulationTime', 'PublishClock.inputs:timeStamp'),
-                ('SimTime.outputs:simulationTime', 'PublishJointState.inputs:timeStamp'),
-                ('SubscribeJointState.outputs:jointNames', 'ArticulationController.inputs:jointNames'),
-                ('SubscribeJointState.outputs:positionCommand', 'ArticulationController.inputs:positionCommand'),
-                ('SubscribeJointState.outputs:velocityCommand', 'ArticulationController.inputs:velocityCommand'),
-                ('SubscribeJointState.outputs:effortCommand', 'ArticulationController.inputs:effortCommand'),
-            ],
-            keys.SET_VALUES: [
-                ('PublishClock.inputs:topicName', 'clock'),
-                ('PublishJointState.inputs:topicName', args.joint_states_topic),
-                ('SubscribeJointState.inputs:topicName', args.joint_commands_topic),
-            ],
-        },
+        {keys.CREATE_NODES: nodes, keys.CONNECT: connections, keys.SET_VALUES: values},
     )
+    if camera_path:
+        set_target(stage, '/ActionGraph/RenderProduct', 'inputs:cameraPrim', camera_path)
     set_target(stage, '/ActionGraph/PublishJointState', 'inputs:targetPrim', articulation_root)
     set_target(stage, '/ActionGraph/ArticulationController', 'inputs:targetPrim', articulation_root)
     # Isaac Sim <= 4.2 selects the robot by string path
@@ -265,13 +356,14 @@ def build_ros2_graph(stage, articulation_root):
 def main():
     stage = omni.usd.get_context().get_stage()
     build_world(stage)
-    import_robot(stage, args.urdf)
+    robot_path = import_robot(stage, args.urdf)
     simulation_app.update()
     tune_joint_drives(stage)
     articulation_root = find_articulation_root(stage)
-    build_ros2_graph(stage, articulation_root)
-    carb.log_info('xarm isaac: articulation {} on /{} and /{}'.format(
-        articulation_root, args.joint_states_topic, args.joint_commands_topic))
+    camera_path = None if args.no_camera else add_camera(stage, robot_path)
+    build_ros2_graph(stage, articulation_root, camera_path)
+    carb.log_info('xarm isaac: articulation {} on /{} and /{}, camera {}'.format(
+        articulation_root, args.joint_states_topic, args.joint_commands_topic, camera_path))
 
     settings = carb.settings.get_settings()
     settings.set('/app/runLoops/main/rateLimitEnabled', True)
