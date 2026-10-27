@@ -11,7 +11,8 @@
 # Builds the xarm_gazebo table world around the robot (robot base = world origin, same as MoveIt),
 # imports the URDF written by the launch file and wires a ROS 2 action graph:
 #   Isaac -> ROS 2: /clock, /isaac_joint_states
-#   ROS 2 -> Isaac: /isaac_joint_commands (position + velocity targets from topic_based_ros2_control)
+#   ROS 2 -> Isaac: /isaac_joint_commands (position + velocity targets from topic_based_ros2_control),
+#                   one topic per ros2_control hardware block, e.g. /isaac_joint_commands/XArmGripperSystem
 #   RealSense (camera at the URDF camera_color_optical_frame, topics of the Gazebo plugin):
 #     /camera/color/image_raw, /camera/color/camera_info, /camera/aligned_depth_to_color/image_raw,
 #     /camera/depth/camera_info, optionally /camera/depth/color/points
@@ -24,7 +25,8 @@ import xml.etree.ElementTree as ET
 
 parser = argparse.ArgumentParser(description='xArm scene for MoveIt in Isaac Sim')
 parser.add_argument('--urdf', required=True, help='URDF written by _robot_moveit_isaac.launch.py')
-parser.add_argument('--joint-commands-topic', default='isaac_joint_commands')
+parser.add_argument('--joint-commands-topic', nargs='+', default=['isaac_joint_commands'],
+                    help='one per ros2_control hardware block (arm, gripper)')
 parser.add_argument('--joint-states-topic', default='isaac_joint_states')
 parser.add_argument('--headless', action='store_true')
 parser.add_argument('--livestream', action='store_true', help='headless + WebRTC stream (Isaac Sim WebRTC Streaming Client)')
@@ -279,29 +281,39 @@ def build_ros2_graph(stage, articulation_root, camera_path):
         ('SimTime', CORE_NODES + '.IsaacReadSimulationTime'),
         ('PublishClock', ROS2_NODES + '.ROS2PublishClock'),
         ('PublishJointState', ROS2_NODES + '.ROS2PublishJointState'),
-        ('SubscribeJointState', ROS2_NODES + '.ROS2SubscribeJointState'),
-        ('ArticulationController', CORE_NODES + '.IsaacArticulationController'),
     ]
     connections = [
         ('OnPlaybackTick.outputs:tick', 'PublishClock.inputs:execIn'),
         ('OnPlaybackTick.outputs:tick', 'PublishJointState.inputs:execIn'),
-        ('OnPlaybackTick.outputs:tick', 'SubscribeJointState.inputs:execIn'),
-        ('OnPlaybackTick.outputs:tick', 'ArticulationController.inputs:execIn'),
         ('Context.outputs:context', 'PublishClock.inputs:context'),
         ('Context.outputs:context', 'PublishJointState.inputs:context'),
-        ('Context.outputs:context', 'SubscribeJointState.inputs:context'),
         ('SimTime.outputs:simulationTime', 'PublishClock.inputs:timeStamp'),
         ('SimTime.outputs:simulationTime', 'PublishJointState.inputs:timeStamp'),
-        ('SubscribeJointState.outputs:jointNames', 'ArticulationController.inputs:jointNames'),
-        ('SubscribeJointState.outputs:positionCommand', 'ArticulationController.inputs:positionCommand'),
-        ('SubscribeJointState.outputs:velocityCommand', 'ArticulationController.inputs:velocityCommand'),
-        ('SubscribeJointState.outputs:effortCommand', 'ArticulationController.inputs:effortCommand'),
     ]
     values = [
         ('PublishClock.inputs:topicName', 'clock'),
         ('PublishJointState.inputs:topicName', args.joint_states_topic),
-        ('SubscribeJointState.inputs:topicName', args.joint_commands_topic),
     ]
+    # a subscriber and controller per commands topic, applying the newest message each frame
+    # (the subscriber takes one message per frame, by default the oldest of 10 queued)
+    controller_names = []
+    for i, topic in enumerate(args.joint_commands_topic):
+        subscriber, controller = 'SubscribeJointState{}'.format(i or ''), 'ArticulationController{}'.format(i or '')
+        controller_names.append(controller)
+        nodes += [
+            (subscriber, ROS2_NODES + '.ROS2SubscribeJointState'),
+            (controller, CORE_NODES + '.IsaacArticulationController'),
+        ]
+        connections += [
+            ('OnPlaybackTick.outputs:tick', subscriber + '.inputs:execIn'),
+            ('OnPlaybackTick.outputs:tick', controller + '.inputs:execIn'),
+            ('Context.outputs:context', subscriber + '.inputs:context'),
+        ] + [(subscriber + '.outputs:' + output, controller + '.inputs:' + output)
+             for output in ('jointNames', 'positionCommand', 'velocityCommand', 'effortCommand')]
+        values += [
+            (subscriber + '.inputs:topicName', topic),
+            (subscriber + '.inputs:queueSize', 1),
+        ]
     if camera_path:
         # One render product at the color optical frame gives color and depth, so depth is aligned to color.
         # Topics of the Gazebo plugin, xarm_description/urdf/camera/realsense.gazebo.xacro
@@ -344,13 +356,15 @@ def build_ros2_graph(stage, articulation_root, camera_path):
     if camera_path:
         set_target(stage, '/ActionGraph/RenderProduct', 'inputs:cameraPrim', camera_path)
     set_target(stage, '/ActionGraph/PublishJointState', 'inputs:targetPrim', articulation_root)
-    set_target(stage, '/ActionGraph/ArticulationController', 'inputs:targetPrim', articulation_root)
-    # Isaac Sim <= 4.2 selects the robot by string path
-    controller = og.Controller.node('/ActionGraph/ArticulationController')
-    if controller.get_attribute_exists('inputs:robotPath'):
-        og.Controller.set(og.Controller.attribute('/ActionGraph/ArticulationController.inputs:robotPath'), articulation_root)
-    if controller.get_attribute_exists('inputs:usePath'):
-        og.Controller.set(og.Controller.attribute('/ActionGraph/ArticulationController.inputs:usePath'), True)
+    for name in controller_names:
+        node_path = '/ActionGraph/' + name
+        set_target(stage, node_path, 'inputs:targetPrim', articulation_root)
+        # Isaac Sim <= 4.2 selects the robot by string path
+        controller = og.Controller.node(node_path)
+        if controller.get_attribute_exists('inputs:robotPath'):
+            og.Controller.set(og.Controller.attribute(node_path + '.inputs:robotPath'), articulation_root)
+        if controller.get_attribute_exists('inputs:usePath'):
+            og.Controller.set(og.Controller.attribute(node_path + '.inputs:usePath'), True)
 
 
 def main():

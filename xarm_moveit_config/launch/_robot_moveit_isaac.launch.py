@@ -31,18 +31,23 @@ ISAAC_DOCKER_DIR = '/xarm_isaac'
 
 
 def add_topic_params(urdf_xml, joint_commands_topic, joint_states_topic):
-    # point every TopicBasedSystem block (arm and gripper) at the Isaac Sim topics
+    # point every TopicBasedSystem block (arm and gripper) at the Isaac Sim topics. Each block gets its own
+    # commands topic: Isaac Sim applies one message per topic and frame, blocks sharing one starve each other
     root = ET.fromstring(urdf_xml)
+    commands_topics = []
     for ros2_control in root.iter('ros2_control'):
         hardware = ros2_control.find('hardware')
         plugin = hardware.find('plugin') if hardware is not None else None
         if plugin is None or plugin.text.strip() != TOPIC_BASED_PLUGIN:
             continue
         # TopicBasedSystem names its node after the block, xacro uses the plugin name ('/' is invalid there)
-        ros2_control.set('name', re.sub(r'\W', '_', ros2_control.get('name')))
-        for name, value in (('joint_commands_topic', joint_commands_topic), ('joint_states_topic', joint_states_topic)):
+        block_name = re.sub(r'\W', '_', ros2_control.get('name'))
+        ros2_control.set('name', block_name)
+        commands_topic = '{}/{}'.format(joint_commands_topic, block_name) if commands_topics else joint_commands_topic
+        commands_topics.append(commands_topic)
+        for name, value in (('joint_commands_topic', commands_topic), ('joint_states_topic', joint_states_topic)):
             ET.SubElement(hardware, 'param', name=name).text = value
-    return ET.tostring(root, encoding='unicode')
+    return ET.tostring(root, encoding='unicode'), commands_topics
 
 
 def write_isaac_bundle(urdf_xml, urdf_path):
@@ -213,7 +218,7 @@ def launch_setup(context, *args, **kwargs):
         geometry_mesh_tcp_rpy=geometry_mesh_tcp_rpy,
     ).to_moveit_configs()
 
-    urdf_xml = add_topic_params(moveit_config.robot_description['robot_description'], joint_commands_topic, joint_states_topic)
+    urdf_xml, joint_commands_topics = add_topic_params(moveit_config.robot_description['robot_description'], joint_commands_topic, joint_states_topic)
     moveit_config.robot_description = {'robot_description': urdf_xml}
     isaac_bundle_dir = write_isaac_bundle(urdf_xml, isaac_urdf_path)
 
@@ -280,7 +285,7 @@ def launch_setup(context, *args, **kwargs):
     # Isaac Sim scene: container (isaac_docker_image), host install (isaac_sim_path / $ISAAC_SIM_PATH),
     # or started by hand from the bundle folder
     isaac_flags = [
-        '--joint-commands-topic', joint_commands_topic.lstrip('/'),
+        '--joint-commands-topic', *[topic.lstrip('/') for topic in joint_commands_topics],
         '--joint-states-topic', joint_states_topic.lstrip('/'),
     ]
     if isaac_headless:
