@@ -472,6 +472,9 @@ __Reminder 4: The <hw_ns> described below is replaced with the actual one, the x
         ros2 launch xarm_moveit_servo lite6_moveit_servo_fake.launch.py
         # Or controlling simulated UFACTORY850:
         ros2 launch xarm_moveit_servo uf850_moveit_servo_fake.launch.py
+        # Or controlling xArm in Isaac Sim with MoveIt (RViz MotionPlanning) active as well, Isaac Sim args as in
+        # xarm6_moveit_isaac.launch.py. The keyboard node opens in its own xterm (keyboard_terminal:='' to run it yourself)
+        ros2 launch xarm_moveit_servo xarm_moveit_servo_isaac.launch.py dof:=6 isaac_docker_image:=nvcr.io/nvidia/isaac-sim:6.2.0
 
         # For controlling real xArm: (use xArm 5 as example)
         ros2 launch xarm_moveit_servo xarm_moveit_servo_realmove.launch.py robot_ip:=192.168.1.123 dof:=5
