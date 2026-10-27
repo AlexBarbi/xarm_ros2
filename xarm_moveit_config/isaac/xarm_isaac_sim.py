@@ -79,6 +79,22 @@ def gz_to_robot(x, y, z):
     return (dy, -dx, dz)
 
 
+# Objects on the table in the robot base frame (x forward, y left). The robot sits at the table edge
+# facing away from it, so everything is placed behind it (x < 0) within reach:
+# three open bins on the left (+y), loose pieces to sort into them on the right (-y)
+TABLE_TOP_Z = gz_to_robot(0.0, 0.0, 1.015)[2]
+RED, GREEN, BLUE = (0.8, 0.1, 0.1), (0.1, 0.6, 0.15), (0.1, 0.25, 0.8)
+BIN_SIZE = (0.13, 0.13, 0.07)  # outer x, y, height
+BIN_WALL = 0.008
+BINS = [((-0.12, 0.28), RED), ((-0.28, 0.28), GREEN), ((-0.44, 0.28), BLUE)]
+PIECE_SIZE = 0.04
+PIECE_MASS = 0.05
+PIECES = [
+    ((-0.15, -0.22), RED), ((-0.27, -0.22), BLUE), ((-0.39, -0.22), GREEN),
+    ((-0.15, -0.34), GREEN), ((-0.27, -0.34), RED), ((-0.39, -0.34), BLUE),
+]
+
+
 def add_static_box(stage, path, center, size, color):
     cube = UsdGeom.Cube.Define(stage, path)
     cube.CreateSizeAttr(1.0)
@@ -86,6 +102,27 @@ def add_static_box(stage, path, center, size, color):
     cube.AddScaleOp().Set(Gf.Vec3f(*size))
     cube.CreateDisplayColorAttr([Gf.Vec3f(*color)])
     UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+
+def add_bin(stage, path, xy, color):
+    # open box: floor and four walls standing on the table
+    (x, y), (sx, sy, h), w, z = xy, BIN_SIZE, BIN_WALL, TABLE_TOP_Z
+    UsdGeom.Xform.Define(stage, path)
+    add_static_box(stage, path + '/Floor', (x, y, z + w / 2), (sx, sy, w), color)
+    for i, side in enumerate((1, -1)):
+        add_static_box(stage, path + '/WallX{}'.format(i), (x + side * (sx - w) / 2, y, z + h / 2), (w, sy, h), color)
+        add_static_box(stage, path + '/WallY{}'.format(i), (x, y + side * (sy - w) / 2, z + h / 2), (sx - 2 * w, w, h), color)
+
+
+def add_piece(stage, path, xy, color):
+    cube = UsdGeom.Cube.Define(stage, path)
+    cube.CreateSizeAttr(PIECE_SIZE)
+    cube.AddTranslateOp().Set(Gf.Vec3d(xy[0], xy[1], TABLE_TOP_Z + PIECE_SIZE / 2 + 0.001))
+    cube.AddOrientOp().Set(Gf.Quatf(1.0))
+    cube.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+    UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+    UsdPhysics.RigidBodyAPI.Apply(cube.GetPrim())
+    UsdPhysics.MassAPI.Apply(cube.GetPrim()).CreateMassAttr(PIECE_MASS)
 
 
 def build_world(stage):
@@ -111,6 +148,10 @@ def build_world(stage):
     for i, (lx, ly) in enumerate([(0.68, 0.38), (0.68, -0.38), (-0.68, 0.38), (-0.68, -0.38)]):
         add_static_box(stage, '/World/Table/Leg{}'.format(i), gz_to_robot(lx, -0.84 + ly, 0.5),
                        (0.04, 0.04, 1.0), (0.3, 0.3, 0.3))
+    for i, (xy, color) in enumerate(BINS):
+        add_bin(stage, '/World/Bins/Bin{}'.format(i), xy, color)
+    for i, (xy, color) in enumerate(PIECES):
+        add_piece(stage, '/World/Pieces/Piece{}'.format(i), xy, color)
 
 
 def import_robot(stage, urdf_path):
