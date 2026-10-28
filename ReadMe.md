@@ -595,7 +595,7 @@ __Reminder 4: The <hw_ns> described below is replaced with the actual one, the x
       - Note that before specifying this parameter, make sure that the corresponding configuration file exists. If it does not exist, you need to connect the robot arm through a script to generate it.
 
 ```bash
-ros2 launch xarm_moveit_config xarm6_moveit_isaac.launch.py isaac_docker_image:=nvcr.io/nvidia/isaac-sim:6.2.0 isaac_docker_args:='-v ~/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw'
+ros2 launch xarm_moveit_config xarm5_moveit_isaac.launch.py isaac_docker_image:=nvcr.io/nvidia/isaac-sim:6.2.0 isaac_docker_args:='-v ~/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw'
 ```
 
 ```bash
