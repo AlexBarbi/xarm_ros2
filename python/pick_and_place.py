@@ -23,6 +23,7 @@ Usage:
   python3 pick_and_place.py             # sort everything
   python3 pick_and_place.py --dry-run   # only scan, and print what is on the table and how it would be taken
   python3 pick_and_place.py --depth-topic /camera/aligned_depth_to_color/image_noisy   # with depth_noise.py running
+  python3 pick_and_place.py --conveyor  # round after round: waits for the belt to stop, sorts, tells it to go on (Ctrl-C ends)
 """
 
 import argparse
@@ -32,6 +33,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -119,6 +121,8 @@ WORK_X = (-0.66, 0.0)
 WORK_Y = (-0.62, 0.04)
 ROBOT_KEEP_OUT = (0.0, 0.0, 0.14)
 MODELS = 'shared/piece_models.json'
+BELT_FILE = 'shared/.conveyor_belt'     # what the belt of shared/conveyor_cycle.py is doing: moving, stopped or off
+ROBOT_FILE = 'shared/.conveyor_robot'   # what this script is doing, for the belt: waiting, working or done
 
 # ---------------------------------------------------------------- motion
 SCAN_XYZ = (-0.377, -0.242, 0.397)  # TCP, gripper pointing down: the camera sees 77% of the work area from here
@@ -753,8 +757,8 @@ class PickAndPlace(Node):
             plans.append((piece, number, grasp))
         return plans, len(pieces)
 
-    def sort_table(self, dry_run):
-        start = time.monotonic()
+    def prepare(self):
+        """Servers, and the table and the bins in the planning scene."""
         self.wait_for_servers()
         end = time.monotonic() + 15.0
         while not self.finger_samples_since(0.0) or len(self.joint_limits) < len(ARM_JOINTS):
@@ -763,6 +767,10 @@ class PickAndPlace(Node):
             time.sleep(0.05)
         self.clear_pieces()
         self.add_objects(self.table_object(), *[self.bin_object(i) for i in range(len(BINS_XY))])
+
+    def sort_pieces(self, dry_run=False):
+        """Clear the table: returns how many pieces went into the bins, and how many did not."""
+        start = time.monotonic()
         placed = 0
         total = 0
         tried = []          # grasps that have been used: a piece still on the table did not work with them
@@ -806,19 +814,67 @@ class PickAndPlace(Node):
         missing = 0 if dry_run else max(total - placed - on_table, 0)
         self.get_logger().info('done: {} dropped into the bins, {} on the table, {} lost, {:.1f} s'.format(
             placed, on_table, missing, time.monotonic() - start))
-        return on_table + missing
+        return placed, on_table + missing
+
+    def sort_table(self, dry_run):
+        self.prepare()
+        return self.sort_pieces(dry_run)[1]
+
+    def belt_says(self):
+        try:
+            return Path(BELT_FILE).read_text().split()
+        except OSError:
+            return []
+
+    def tell_belt(self, *state):
+        """Written whole in one go: the belt must never read half of it."""
+        temporary = Path(ROBOT_FILE + '.tmp')
+        temporary.write_text(' '.join(state))
+        temporary.replace(ROBOT_FILE)
+
+    def follow_conveyor(self):
+        """Round after round: a piece is never looked for on a moving belt, and the belt does not move under the robot."""
+        self.prepare()
+        self.move_to(make_pose(*SCAN_XYZ, top_down(0.0)), 'scan', FREE_SPEED)
+        self.tell_belt('waiting')
+        self.get_logger().info('waiting for the belt to stop')
+        last = None                 # the number of the round, not the moving in between, which can pass unseen
+        placed = 0
+        rounds = 0
+        try:
+            while True:
+                belt = self.belt_says()
+                if belt[:1] == ['off']:
+                    last = None         # Stop in Isaac Sim: its script may start counting again
+                if belt[:1] == ['stopped'] and belt[1] != last:
+                    last = belt[1]
+                    rounds += 1
+                    self.tell_belt('working', last)
+                    self.get_logger().info('belt stopped, round {}'.format(last))
+                    try:
+                        placed += self.sort_pieces()[0]
+                    except RuntimeError as e:
+                        self.get_logger().error('round {}: {}'.format(last, e))
+                    self.tell_belt('done', last)
+                    self.get_logger().info('{} rounds, {} pieces dropped into the bins so far'.format(rounds, placed))
+                time.sleep(0.1)
+        finally:
+            Path(ROBOT_FILE).unlink(missing_ok=True)    # gone: the belt goes on by itself
 
 
 def main():
     parser = argparse.ArgumentParser(description='Sort the pieces on the table into their bins (xArm5 + gripper + wrist camera)')
     parser.add_argument('--dry-run', action='store_true', help='only scan, and print what is on the table')
     parser.add_argument('--depth-topic', default=DEPTH_TOPIC, help='depth image to use, e.g. the one of depth_noise.py')
+    parser.add_argument('--conveyor', action='store_true', help='work with the belt round after round, until Ctrl-C')
     args = parser.parse_args(remove_ros_args(sys.argv)[1:])
 
     rclpy.init(args=sys.argv)
     node = PickAndPlace(args.depth_topic)
     try:
-        if node.sort_table(args.dry_run) and not args.dry_run:
+        if args.conveyor:
+            node.follow_conveyor()
+        elif node.sort_table(args.dry_run) and not args.dry_run:
             sys.exit(1)
     except RuntimeError as e:
         node.get_logger().error(str(e))

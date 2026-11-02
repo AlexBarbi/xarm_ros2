@@ -17,6 +17,7 @@ Results go in batch_results/<date>/, written after every run:
 Scenarios: scene (world.usd as it is), table (pieces at random, on the table), tipped (the same, many on their side),
 touching (pairs of pieces in contact), belt (a round of the conveyor). --out on an existing folder goes on from there.
 
+Runs one sort at a time, without --conveyor: on the belt it starts when the belt has stopped, and the belt waits for it.
 Only the codes active in PIECE_BINS of pick_and_place.py are used, on the table and on the belt.
 
 Needs Isaac Sim in a container (--container) or installed here (--container '' --isaac-path), the workspace built, and
