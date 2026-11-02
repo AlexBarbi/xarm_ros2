@@ -112,7 +112,7 @@ BIN_WALL = 0.008
 WORK_X = (-0.66, 0.0)
 WORK_Y = (-0.62, 0.2)
 ROBOT_KEEP_OUT = (0.0, 0.0, 0.14)
-MODELS = Path(__file__).resolve().parent / 'shared' / 'piece_models.json'
+MODELS = 'shared/piece_models.json'
 
 # ---------------------------------------------------------------- motion
 SCAN_XYZ = (-0.377, -0.242, 0.397)  # TCP, gripper pointing down: the camera sees 77% of the work area from here
