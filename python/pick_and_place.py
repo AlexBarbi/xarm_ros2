@@ -15,13 +15,14 @@ xarm5_moveit_isaac.launch.py), and the same goes for the joints of shared/world.
 Only moveit_msgs is needed (no moveit_py): the script talks to the move_group node through
   /move_action (MoveGroup), /compute_ik, /compute_fk, /compute_cartesian_path, /execute_trajectory,
   /apply_planning_scene, /get_planning_scene
-and drives the gripper controller directly on /xarm_gripper_traj_controller/follow_joint_trajectory,
-watching drive_joint in /joint_states (and its effort in /isaac_joint_states) to feel when the fingers touch a piece
-and, all the way to the bin, whether they still have it.
+and drives the gripper directly: the action of the robot driver (xarm_gripper/gripper_action) on the real arm, the
+trajectory controller in simulation. Neither says anything about force, so everything it knows about a piece comes from
+drive_joint in /joint_states: the fingers are sent past the piece, and it is there as long as they stay short of that.
 
 Usage:
   python3 pick_and_place.py             # sort everything
   python3 pick_and_place.py --dry-run   # only scan, and print what is on the table and how it would be taken
+  python3 pick_and_place.py --depth-topic /camera/aligned_depth_to_color/image_noisy   # with depth_noise.py running
 """
 
 import argparse
@@ -31,11 +32,10 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
-from pathlib import Path
 
 import numpy as np
 import rclpy
-from rclpy.action import ActionClient
+from rclpy.action import ActionClient, get_action_names_and_types
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
@@ -43,7 +43,7 @@ from rclpy.utilities import remove_ros_args
 from scipy.spatial.transform import Rotation
 
 from builtin_interfaces.msg import Duration
-from control_msgs.action import FollowJointTrajectory
+from control_msgs.action import FollowJointTrajectory, GripperCommand
 from geometry_msgs.msg import Point, Pose, Quaternion
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (AttachedCollisionObject, CollisionObject, Constraints, JointConstraint, MoveItErrorCodes,
@@ -61,6 +61,14 @@ PIECE_BINS = {
     '100000049205': 0,
     '100000051189': 1,
     '100000057387': 2,
+    '100000047465': 3,
+    '100000047481': 4,
+    '100000047527': 5,
+    '100000047531': 6,
+    '100000052737': 7,
+    '100000053152': 8,
+    '100000056753': 9,
+    '100000057388': 10,
 }
 
 # ---------------------------------------------------------------- robot
@@ -74,7 +82,8 @@ TCP_LINK = 'link_tcp'               # between the fingertips, 0.172 m from the g
 CAMERA_LINK = 'camera_color_optical_frame'
 DEPTH_TOPIC = '/camera/aligned_depth_to_color/image_raw'
 CAMERA_INFO_TOPIC = '/camera/color/camera_info'
-GRIPPER_ACTION = '/xarm_gripper_traj_controller/follow_joint_trajectory'
+GRIPPER_ACTIONS = {'xarm_gripper/gripper_action': GripperCommand,     # end of the action name on the real arm
+                   'xarm_gripper_traj_controller/follow_joint_trajectory': FollowJointTrajectory}   # in simulation
 GRIPPER_JOINT = 'drive_joint'
 GRIPPER_OPEN = 0.0
 GRIPPER_CLOSED = 0.85               # fingers touching each other
@@ -84,14 +93,9 @@ GRIPPER_RELEASE = 0.3               # rad opened to let go of a piece: enough, a
 GRIPPER_CLOSE_SPEED = 0.35          # rad/s closing on a piece: slow enough to stop on it instead of slamming it
 GRIPPER_STALL_TIME = 0.2            # s without finger motion while closing = contact
 GRIPPER_STALL_TOL = 0.005           # rad of finger motion still counted as stopped
-GRIPPER_EFFORT_TOPIC = '/isaac_joint_states'  # Isaac Sim publishes the drive efforts here (not on the real robot)
-GRIPPER_CONTACT_EFFORT = 1.0        # N*m on drive_joint while closing = contact (closing on nothing: ~0.02)
-GRIPPER_CONTACT_TIME = 0.04         # s it has to last: brushing a piece gives a one sample spike
-GRIPPER_HELD_ERROR = 0.003          # rad short of the target after squeezing = blocked, without effort to read
-GRIPPER_SQUEEZE = 0.004             # rad commanded past the contact; the grip force is capped by the drive's maxForce
-GRIPPER_HELD_EFFORT = 0.3           # N*m on drive_joint after squeezing = something is between the fingers
-GRIPPER_SLACK_TIME = 0.05           # s under GRIPPER_HELD_EFFORT while carrying = the piece is gone, or loose in the swing
-GRIPPER_MISS_MARGIN = 0.008         # m: fingers this much closer than the width of the piece = nothing between them
+GRIPPER_HELD_ERROR = 0.01           # rad short of the target = stopped by something, closer = nothing between the fingers
+GRIPPER_MISS_MARGIN = 0.008         # m: the fingers are sent this much closer than the width of the piece
+GRIPPER_FREE_SAMPLES = 3            # samples of drive_joint in a row at the target, while carrying = the piece is gone
 GRIPPER_TIMEOUT = 30.0              # s of wall clock: Isaac Sim can run much slower than real time
 TOUCH_LINKS = ['xarm_gripper_base_link', 'left_outer_knuckle', 'left_finger', 'left_inner_knuckle',
                'right_outer_knuckle', 'right_finger', 'right_inner_knuckle', 'link_tcp']
@@ -102,7 +106,9 @@ TABLE_SIZE = (0.8, 1.5, 0.03)
 TABLE_CENTER_XY = (-0.34, -0.2)
 
 # open bins: centers, inner size, outer height, wall/floor thickness
-BINS_XY = [(-0.12, 0.28), (-0.28, 0.28), (-0.44, 0.28)]
+BINS_XY = [(-0.12, 0.28), (-0.28, 0.28), (-0.44, 0.28), (-0.60, 0.28),
+           (-0.12, 0.44), (-0.28, 0.44), (-0.44, 0.44),                 # (-0.60, 0.44) is out of reach
+           (-0.12, 0.12), (-0.28, 0.12), (-0.44, 0.12), (-0.60, 0.12)]
 BIN_BOTTOM_Z = TABLE_TOP_Z
 BIN_INNER = (0.114, 0.114)          # x, y
 BIN_HEIGHT = 0.07
@@ -110,7 +116,7 @@ BIN_WALL = 0.008
 
 # part of the table the camera looks for pieces in: up to the bins, without the base of the robot
 WORK_X = (-0.66, 0.0)
-WORK_Y = (-0.62, 0.2)
+WORK_Y = (-0.62, 0.04)
 ROBOT_KEEP_OUT = (0.0, 0.0, 0.14)
 MODELS = 'shared/piece_models.json'
 
@@ -169,11 +175,11 @@ class PieceDropped(RuntimeError):
 
 class PickAndPlace(Node):
 
-    def __init__(self):
+    def __init__(self, depth_topic=DEPTH_TOPIC):
         super().__init__('pick_and_place')
         self.move_client = ActionClient(self, MoveGroup, 'move_action')
         self.execute_client = ActionClient(self, ExecuteTrajectory, 'execute_trajectory')
-        self.gripper_client = ActionClient(self, FollowJointTrajectory, GRIPPER_ACTION)
+        self.gripper_client = None
         self.ik_client = self.create_client(GetPositionIK, 'compute_ik')
         self.fk_client = self.create_client(GetPositionFK, 'compute_fk')
         self.cartesian_client = self.create_client(GetCartesianPath, 'compute_cartesian_path')
@@ -184,18 +190,17 @@ class PickAndPlace(Node):
         self.joints_stamp = 0.0
         self.joint_limits = {}
         self.tall_in_bin = [0] * len(BINS_XY)
+        self.bin_top = 0.0                          # height above the table of the tallest piece standing in a bin
         self.create_subscription(String, 'robot_description', self.on_robot_description,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         # (stamp [s], position) of drive_joint, stamps in simulated time with Isaac Sim
         self.finger_samples = deque(maxlen=1000)
         self.finger_lock = threading.Lock()
         self.create_subscription(JointState, 'joint_states', self.on_joint_states, 10)
-        self.finger_efforts = deque(maxlen=20)      # (stamp [s], effort) of drive_joint, when someone publishes it
-        self.carried_width = None                   # of the piece in the gripper: arm motions watch the grip meanwhile
-        self.create_subscription(JointState, GRIPPER_EFFORT_TOPIC, self.on_effort, 10)
+        self.carrying = False                       # arm motions watch the grip meanwhile
         self.depth = None
         self.camera_info = None
-        self.create_subscription(Image, DEPTH_TOPIC, self.on_depth, qos_profile_sensor_data)
+        self.create_subscription(Image, depth_topic, self.on_depth, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, CAMERA_INFO_TOPIC, self.on_camera_info, qos_profile_sensor_data)
 
         # Node.executor is taken by rclpy
@@ -222,12 +227,6 @@ class PickAndPlace(Node):
             with self.finger_lock:
                 self.finger_samples.append((self.joints_stamp, msg.position[msg.name.index(GRIPPER_JOINT)]))
 
-    def on_effort(self, msg):
-        if GRIPPER_JOINT in msg.name and len(msg.effort) == len(msg.name):
-            effort = msg.effort[msg.name.index(GRIPPER_JOINT)]
-            if math.isfinite(effort):
-                self.finger_efforts.append((msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9, effort))
-
     def on_depth(self, msg):
         self.depth = msg
 
@@ -240,7 +239,21 @@ class PickAndPlace(Node):
 
     # ------------------------------------------------------------ plumbing
 
+    def find_gripper(self, timeout):
+        """The real gripper is an action of the robot driver, in simulation a controller moves it."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            names = [name for name, _ in get_action_names_and_types(self)]
+            for ending, kind in GRIPPER_ACTIONS.items():
+                for name in names:
+                    if name.endswith(ending):
+                        self.get_logger().info('gripper: {}'.format(name))
+                        return ActionClient(self, kind, name), kind
+            time.sleep(0.2)
+        raise RuntimeError('no gripper action, looked for {}'.format(list(GRIPPER_ACTIONS)))
+
     def wait_for_servers(self, timeout=15.0):
+        self.gripper_client, self.gripper_kind = self.find_gripper(timeout)
         for client in (self.move_client, self.execute_client, self.gripper_client):
             if not client.wait_for_server(timeout_sec=timeout):
                 raise RuntimeError('action server {} not available'.format(client._action_name))
@@ -377,7 +390,7 @@ class PickAndPlace(Node):
             if msg is not None and msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9 > arrived + 0.05:
                 break
             if time.monotonic() > end:
-                raise RuntimeError('no depth image on {}'.format(DEPTH_TOPIC))
+                raise RuntimeError('no depth image')
             time.sleep(0.01)
         if msg.encoding == '32FC1':
             return np.frombuffer(bytes(msg.data), np.float32).reshape(msg.height, msg.width).astype(float)
@@ -561,8 +574,12 @@ class PickAndPlace(Node):
                 return
         raise RuntimeError('{}: only reachable by folding the arm over'.format(what))
 
-    @staticmethod
-    def gripper_goal(position, duration):
+    def gripper_goal(self, position, duration):
+        """The time to get there is only for the simulated gripper: the real one has one speed, set in the driver."""
+        if self.gripper_kind is GripperCommand:
+            goal = GripperCommand.Goal()
+            goal.command.position = float(position)
+            return goal
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = [GRIPPER_JOINT]
         goal.trajectory.points = [JointTrajectoryPoint(
@@ -577,56 +594,35 @@ class PickAndPlace(Node):
             return
         try:
             result = self.run_action(self.gripper_client, goal, '{} gripper'.format(what), timeout=GRIPPER_TIMEOUT)
-            if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+            if getattr(result, 'error_code', 0) != 0:
                 self.get_logger().warn('{} gripper: controller says {} {}'.format(what, result.error_code, result.error_string))
         except RuntimeError as e:
             self.get_logger().warn(str(e))
 
-    def pushing(self, since, effort):
-        """The fingers have been pushing on something for GRIPPER_CONTACT_TIME."""
-        efforts = [sample for sample in list(self.finger_efforts) if sample[0] > since]
-        recent = [e for t, e in efforts if t >= efforts[-1][0] - GRIPPER_CONTACT_TIME] if efforts else []
-        return len(recent) >= 3 and min(abs(e) for e in recent) > effort
-
-    def holding(self, since):
-        """Something resists the fingers: drive effort when it is published, else they stopped short of the target."""
-        if self.finger_efforts:
-            return self.pushing(since, GRIPPER_HELD_EFFORT)
-        return self.grip_target - self.finger_samples_since(0.0)[-1][1] > GRIPPER_HELD_ERROR
-
-    def grip_slack(self):
-        """Nothing has resisted the fingers for GRIPPER_SLACK_TIME."""
-        if not self.finger_efforts:
-            return not self.holding(0.0)
-        efforts = list(self.finger_efforts)
-        recent = [abs(e) for t, e in efforts if t > efforts[-1][0] - GRIPPER_SLACK_TIME]
-        return len(recent) >= 3 and max(recent) < GRIPPER_HELD_EFFORT
+    def fingers_free(self, count=1):
+        """Nothing stops the fingers: the last samples of drive_joint are at the target they were sent to."""
+        samples = self.finger_samples_since(0.0)[-count:]
+        return len(samples) == count and all(self.grip_target - p < GRIPPER_HELD_ERROR for _, p in samples)
 
     def check_grip(self, motion, what):
         """Stop an arm motion as soon as the piece it carries is gone, wherever that happens on the way."""
-        if self.carried_width is None or not self.grip_slack():
+        if not self.carrying or not self.fingers_free(GRIPPER_FREE_SAMPLES):
             return
-        # The fingers do not move when a piece leaves them, and a piece that only shifted between them gives the same
-        # reading: closing on it again tells, and stopping the arm for nothing could throw it.
-        joints = dict(self.joints)          # the arm is well past this point by the time the answer comes
-        try:
-            self.close_on(self.carried_width)
-            self.get_logger().warn('{}: the grip went slack, the piece is still there'.format(what))
-        except RuntimeError:
-            self.carried_width = None
-            self.wait(motion.cancel_goal_async(), 5.0, what)
-            self.wait(motion.get_result_async(), 10.0, what)
-            position = self.link_pose(TCP_LINK, joints)[1]
-            raise PieceDropped('lost during {}, around ({:.3f}, {:.3f}, {:.3f})'.format(what, *position))
+        joints = dict(self.joints)          # the arm is well past this point by the time it has stopped
+        self.carrying = False
+        self.wait(motion.cancel_goal_async(), 5.0, what)
+        self.wait(motion.get_result_async(), 10.0, what)
+        position = self.link_pose(TCP_LINK, joints)[1]
+        raise PieceDropped('lost during {}, around ({:.3f}, {:.3f}, {:.3f})'.format(what, *position))
 
     def close_on(self, width):
-        """Close until the fingers touch the piece, then squeeze it a little. Raises when they miss it."""
-        # Commanding fully closed pushes the fingers into the piece with the whole drive force (in Isaac Sim this
-        # breaks the gripper linkage and the arm flings the piece away): close slowly and stop at the contact, felt
-        # as drive effort when it is published (Isaac Sim), else as drive_joint stalling.
+        """Close on a piece. Raises when the fingers miss it."""
+        # The fingers are sent past the piece: they stop on it and keep pressing, with the force the gripper is limited
+        # to (maxForce of the drive in Isaac Sim), also if it shifts between them. Slow, not to slam it. Staying short
+        # of the target is all there is to know that a piece is there: the driver reports no force, in any way.
         start_stamp, start_position = self.finger_samples_since(0.0)[-1]
-        missed = finger_position(max(width - GRIPPER_MISS_MARGIN, 0.0))
-        goal = self.gripper_goal(GRIPPER_CLOSED, (GRIPPER_CLOSED - start_position) / GRIPPER_CLOSE_SPEED)
+        self.grip_target = finger_position(max(width - GRIPPER_MISS_MARGIN, 0.0))
+        goal = self.gripper_goal(self.grip_target, (self.grip_target - start_position) / GRIPPER_CLOSE_SPEED)
         handle = self.wait(self.gripper_client.send_goal_async(goal), 10.0, 'close gripper')
         if not handle.accepted:
             raise RuntimeError('close gripper: goal rejected')
@@ -636,31 +632,19 @@ class PickAndPlace(Node):
             if time.monotonic() > end:
                 raise RuntimeError('close gripper: timed out after {:.0f} s'.format(GRIPPER_TIMEOUT))
             time.sleep(0.005)
-            if self.pushing(start_stamp, GRIPPER_CONTACT_EFFORT):
-                break
             samples = self.finger_samples_since(start_stamp)
-            stamp, position = samples[-1]
-            if position > missed:
-                break
+            if self.fingers_free() or not samples:
+                continue
             # stalled: no motion over the last GRIPPER_STALL_TIME, once the fingers have started (or could have)
+            stamp, position = samples[-1]
             started = position - start_position > 2 * GRIPPER_STALL_TOL or stamp - start_stamp > 1.0
             recent = [p for t, p in samples if t >= stamp - GRIPPER_STALL_TIME]
             if started and stamp - start_stamp >= GRIPPER_STALL_TIME and max(recent) - min(recent) < GRIPPER_STALL_TOL:
                 break
-        position = self.finger_samples_since(0.0)[-1][1]
-
-        if position > missed:
-            # leave the fingers where they are: the next gripper goal replaces this one
-            self.gripper(position, 'stop', wait=False)
-            raise RuntimeError('close gripper: nothing between the fingers at {:.2f} rad'.format(position))
-        self.get_logger().info('close gripper: contact at {:.3f} rad'.format(position))
-        # replaces the closing goal, the controller starts it from the measured position
-        self.grip_target = min(position + GRIPPER_SQUEEZE, GRIPPER_CLOSED)
-        squeezed = self.finger_samples_since(0.0)[-1][0]
-        self.gripper(self.grip_target, 'squeeze')
-        time.sleep(0.03)
-        if not self.holding(squeezed):
-            raise RuntimeError('close gripper: nothing to squeeze at {:.3f} rad'.format(position))
+        self.grip_contact = self.finger_samples_since(0.0)[-1][1]
+        if self.fingers_free():
+            raise RuntimeError('close gripper: nothing between the fingers at {:.2f} rad'.format(self.grip_contact))
+        self.get_logger().info('close gripper: contact at {:.3f} rad, sent to {:.3f}'.format(self.grip_contact, self.grip_target))
 
     # ------------------------------------------------------------ task
 
@@ -690,16 +674,16 @@ class PickAndPlace(Node):
         self.move_linear(make_pose(grasp.x, grasp.y, z, q), 'approach')
         self.close_on(grasp.width)
         self.attach_object(obj)
-        self.carried_width = grasp.width
+        self.carrying = True
         try:
             self.carry_to_bin(piece, grasp, bin_index, tallest_left, z, yaw)
         finally:
-            self.carried_width = None
-            self.gripper(self.grip_target - GRIPPER_RELEASE, 'release')     # never go on with a piece in the gripper
+            self.carrying = False
+            self.gripper(self.grip_contact - GRIPPER_RELEASE, 'release')    # never go on with a piece in the gripper
             self.detach_object(obj.id)
 
     def carry_to_bin(self, piece, grasp, bin_index, tallest_left, z, yaw):
-        carry_z = z + max(BIN_HEIGHT, tallest_left) + CARRY_CLEARANCE
+        carry_z = z + max(BIN_HEIGHT, self.bin_top, tallest_left) + CARRY_CLEARANCE
         try:
             self.move_linear(make_pose(grasp.x, grasp.y, carry_z, top_down(yaw)), 'lift')
         except PieceDropped as e:
@@ -801,7 +785,9 @@ class PickAndPlace(Node):
                     try:
                         self.pick_and_drop(piece, grasp, PIECE_BINS[number], tallest_left)
                         placed += 1
-                        self.tall_in_bin[PIECE_BINS[number]] += piece.height > BIN_HEIGHT
+                        if piece.height > BIN_HEIGHT:
+                            self.tall_in_bin[PIECE_BINS[number]] += 1
+                            self.bin_top = max(self.bin_top, BIN_WALL + piece.height)
                         self.get_logger().info('{} placed, {:.1f} s since the start'.format(number, time.monotonic() - start))
                         break
                     except PieceDropped as e:
@@ -825,10 +811,11 @@ class PickAndPlace(Node):
 def main():
     parser = argparse.ArgumentParser(description='Sort the pieces on the table into their bins (xArm5 + gripper + wrist camera)')
     parser.add_argument('--dry-run', action='store_true', help='only scan, and print what is on the table')
+    parser.add_argument('--depth-topic', default=DEPTH_TOPIC, help='depth image to use, e.g. the one of depth_noise.py')
     args = parser.parse_args(remove_ros_args(sys.argv)[1:])
 
     rclpy.init(args=sys.argv)
-    node = PickAndPlace()
+    node = PickAndPlace(args.depth_topic)
     try:
         if node.sort_table(args.dry_run) and not args.dry_run:
             sys.exit(1)

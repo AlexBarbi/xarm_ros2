@@ -21,6 +21,8 @@ from scipy.spatial.transform import Rotation
 
 CELL = 0.001                    # height map resolution
 MIN_PIECE_HEIGHT = 0.004        # lower than this is the table
+MEDIAN_CELLS = 3                # the depth noise goes with a median this wide: wider, it eats the thin ribs of the pieces
+TOP_PERCENTILE = 99.8           # of the height of a piece: the very highest cell is noise
 MAX_PIECE_HEIGHT = 0.14         # higher than this is the gripper in the view
 MIN_PIECE_CELLS = 150
 PIECE_MERGE_CELLS = 3           # parts of the height map closer than twice this are the same piece
@@ -123,7 +125,9 @@ class PieceLibrary:
             center_of_mass = np.array(models[number]['center_of_mass'])
             for rotation in resting_rotations(points, center_of_mass):
                 p = rotation.apply(points)
-                length, width, _ = min_area_rectangle(p[:, :2])
+                # as the height map sees it: a flange lower than MIN_PIECE_HEIGHT is part of the table
+                seen = p[p[:, 2] - p[:, 2].min() > MIN_PIECE_HEIGHT]
+                length, width, _ = min_area_rectangle(seen[:, :2])
                 self.signatures.append((number, float(np.ptp(p[:, 2])), length, width))
 
     def identify(self, piece):
@@ -170,6 +174,7 @@ class TableMap:
         self.x0, self.y0 = x_range[0], y_range[0]
         self.shape = (int(round((x_range[1] - x_range[0]) / CELL)), int(round((y_range[1] - y_range[0]) / CELL)))
         self.height = np.zeros(self.shape)
+        self.views = np.zeros(self.shape)           # the views put together, before segment cleans them up
         self.seen = np.zeros(self.shape, bool)
         self.keep_out = keep_out
         self.labels = None
@@ -183,12 +188,20 @@ class TableMap:
         iy = np.floor((points[:, 1] - self.y0) / CELL).astype(int)
         h = points[:, 2] - self.table_z
         keep = (ix >= 0) & (ix < self.shape[0]) & (iy >= 0) & (iy < self.shape[1]) & (h < MAX_PIECE_HEIGHT)
-        self.seen[ix[keep], iy[keep]] = True
-        np.maximum.at(self.height, (ix[keep], iy[keep]), h[keep])
+        # In a view, a cell takes the highest of its points: the camera sees the wall of a piece from the side, and all
+        # of it falls in the same cell as the top. Noise only goes after that, view by view: the highest of noisy views
+        # is too high, more so the more views there are, and pieces come out 5 mm taller and 10 mm longer.
+        view = np.zeros(self.shape)
+        seen = np.zeros(self.shape, bool)
+        seen[ix[keep], iy[keep]] = True
+        np.maximum.at(view, (ix[keep], iy[keep]), h[keep])
+        view = np.where(seen, view, ndimage.grey_closing(view, size=3))     # the camera pixels are larger than the cells
+        self.views = np.maximum(self.views, ndimage.median_filter(view, size=MEDIAN_CELLS))
+        self.seen |= seen
 
     def segment(self):
         """Split the height map into pieces."""
-        height = ndimage.grey_closing(self.height, size=3)     # the camera pixels are larger than the cells
+        height = self.views.copy()
         xs = self.x0 + (np.arange(self.shape[0]) + 0.5) * CELL
         ys = self.y0 + (np.arange(self.shape[1]) + 0.5) * CELL
         gx, gy = np.meshgrid(xs, ys, indexing='ij')
@@ -219,7 +232,7 @@ class TableMap:
         u, v = xy[:, 0] * c + xy[:, 1] * s, -xy[:, 0] * s + xy[:, 1] * c
         mid_u, mid_v = (u.min() + u.max()) / 2, (v.min() + v.max()) / 2
         weights = self.height[cells[:, 0], cells[:, 1]]
-        return Piece(int(label), (mid_u * c - mid_v * s, mid_u * s + mid_v * c), float(weights.max()),
+        return Piece(int(label), (mid_u * c - mid_v * s, mid_u * s + mid_v * c), float(np.percentile(weights, TOP_PERCENTILE)),
                      length, width, angle, tuple(xy.T @ weights / weights.sum()))
 
     def split(self, piece, library):
