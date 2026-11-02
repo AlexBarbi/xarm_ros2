@@ -7,15 +7,18 @@
 # The Isaac Sim side is isaac/xarm_isaac_sim.py, copied with URDF and meshes into a bundle folder
 # (default /tmp/xarm_isaac) and started here from a host install (isaac_sim_path) or a container
 # (isaac_docker_image).
+# isaac_shared_dir (default <workspace>/shared, /shared in the container) keeps files across runs:
+# save the edited scene there with File > Save As and load it back with isaac_world:=<file>.
 
 import os
 import re
 import shlex
 import shutil
+import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 import yaml
-from ament_index_python import get_package_share_directory
+from ament_index_python import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import OpaqueFunction, IncludeLaunchDescription, ExecuteProcess, LogInfo
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -28,6 +31,9 @@ from uf_ros_lib.uf_robot_utils import generate_ros2_control_params_temp_file
 TOPIC_BASED_PLUGIN = 'topic_based_ros2_control/TopicBasedSystem'
 ISAAC_SCRIPT = 'xarm_isaac_sim.py'
 ISAAC_DOCKER_DIR = '/xarm_isaac'
+ISAAC_DOCKER_SHARED_DIR = '/shared'
+# user of the Isaac Sim >= 5 containers (isaac-sim)
+ISAAC_DOCKER_UID = 1234
 
 
 def add_topic_params(urdf_xml, joint_commands_topic, joint_states_topic):
@@ -86,7 +92,27 @@ def write_isaac_bundle(urdf_xml, urdf_path):
     return bundle_dir
 
 
-def isaac_docker_cmd(image, bundle_dir, script_args, ros_distro, show_gui, extra_args):
+def default_shared_dir():
+    # <workspace>/shared, next to the colcon install folder (install/<pkg> or merged install/)
+    install_dir = get_package_prefix('xarm_moveit_config')
+    if os.path.basename(install_dir) != 'install':
+        install_dir = os.path.dirname(install_dir)
+    return os.path.join(os.path.dirname(install_dir), 'shared')
+
+
+def share_with_container(shared_dir):
+    # The container user is not the host user: ACLs let it write into the folder, and the default ACLs
+    # (inherited by new files and folders) keep what it saves there editable on the host
+    os.makedirs(shared_dir, exist_ok=True)
+    acl = 'u:{0}:rwx,d:u:{0}:rwx,d:u:{1}:rwx'.format(ISAAC_DOCKER_UID, os.getuid())
+    try:
+        subprocess.run(['setfacl', '-m', acl, shared_dir], check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print('[WARN] isaac: cannot set ACLs on {} ({}), Isaac Sim may not be able to save there, '
+              'try: chmod 777 {}'.format(shared_dir, e, shared_dir))
+
+
+def isaac_docker_cmd(image, bundle_dir, shared_dir, script_args, ros_distro, show_gui, extra_args):
     cmd = [
         'docker', 'run', '--rm', '--name', 'xarm_isaac_sim', '--gpus', 'all', '--network=host',
         '-e', 'ACCEPT_EULA=Y', '-e', 'PRIVACY_CONSENT=Y',
@@ -98,6 +124,7 @@ def isaac_docker_cmd(image, bundle_dir, script_args, ros_distro, show_gui, extra
         # host networking makes Fast DDS pick shared memory, which does not reach the host from the container
         '-e', 'FASTRTPS_DEFAULT_PROFILES_FILE={}/fastdds_udp.xml'.format(ISAAC_DOCKER_DIR),
         '-v', '{}:{}'.format(bundle_dir, ISAAC_DOCKER_DIR),
+        '-v', '{}:{}'.format(shared_dir, ISAAC_DOCKER_SHARED_DIR),
     ]
     if show_gui and os.environ.get('DISPLAY'):
         cmd += ['-e', 'DISPLAY', '-v', '/tmp/.X11-unix:/tmp/.X11-unix']
@@ -162,6 +189,11 @@ def launch_setup(context, *args, **kwargs):
     isaac_docker_image = LaunchConfiguration('isaac_docker_image', default='').perform(context)
     isaac_docker_args = LaunchConfiguration('isaac_docker_args', default='').perform(context)
     isaac_ros_distro = LaunchConfiguration('isaac_ros_distro', default='jazzy').perform(context)
+    # folder kept across runs, mounted at /shared in the container
+    isaac_shared_dir = LaunchConfiguration('isaac_shared_dir', default=os.environ.get('ISAAC_SHARED_DIR', default_shared_dir())).perform(context)
+    isaac_shared_dir = os.path.abspath(os.path.expanduser(isaac_shared_dir))
+    # USD scene saved from an earlier run, loaded instead of the table world, relative to isaac_shared_dir
+    isaac_world = LaunchConfiguration('isaac_world', default='').perform(context)
 
     ros2_control_plugin = TOPIC_BASED_PLUGIN
     controllers_name = 'fake_controllers'
@@ -300,13 +332,25 @@ def launch_setup(context, *args, **kwargs):
             isaac_flags.append('--camera-pointcloud')
     else:
         isaac_flags.append('--no-camera')
+    host_world_flags, docker_world_flags = [], []
+    if isaac_world:
+        isaac_world = os.path.join(isaac_shared_dir, os.path.expanduser(isaac_world))
+        if not os.path.isfile(isaac_world):
+            raise RuntimeError('isaac_world {} not found'.format(isaac_world))
+        world_rel_path = os.path.relpath(isaac_world, isaac_shared_dir)
+        if isaac_docker_image and world_rel_path.startswith(os.pardir):
+            raise RuntimeError('isaac_world {} must be in isaac_shared_dir {} to be seen by the container'.format(
+                isaac_world, isaac_shared_dir))
+        host_world_flags = ['--world', isaac_world]
+        docker_world_flags = ['--world', '{}/{}'.format(ISAAC_DOCKER_SHARED_DIR, world_rel_path)]
     host_cmd = [
         os.path.join(isaac_bundle_dir, ISAAC_SCRIPT), '--urdf', os.path.abspath(isaac_urdf_path)
-    ] + isaac_flags
+    ] + isaac_flags + host_world_flags
     if isaac_docker_image:
-        docker_flags = ['--urdf', '{}/{}'.format(ISAAC_DOCKER_DIR, os.path.basename(isaac_urdf_path))] + isaac_flags
+        share_with_container(isaac_shared_dir)
+        docker_flags = ['--urdf', '{}/{}'.format(ISAAC_DOCKER_DIR, os.path.basename(isaac_urdf_path))] + isaac_flags + docker_world_flags
         isaac_node = ExecuteProcess(
-            cmd=isaac_docker_cmd(isaac_docker_image, isaac_bundle_dir, docker_flags, isaac_ros_distro,
+            cmd=isaac_docker_cmd(isaac_docker_image, isaac_bundle_dir, isaac_shared_dir, docker_flags, isaac_ros_distro,
                                  not (isaac_headless or isaac_livestream), isaac_docker_args),
             output='screen',
         )

@@ -9,6 +9,7 @@
 # /xarm_isaac when Isaac Sim runs in a container).
 #
 # Builds the xarm_gazebo table world around the robot (robot base = world origin, same as MoveIt),
+# or opens a scene saved from an earlier run (--world, e.g. /shared/my_scene.usd in the container),
 # imports the URDF written by the launch file and wires a ROS 2 action graph:
 #   Isaac -> ROS 2: /clock, /isaac_joint_states
 #   ROS 2 -> Isaac: /isaac_joint_commands (position + velocity targets from topic_based_ros2_control),
@@ -31,6 +32,8 @@ parser.add_argument('--joint-states-topic', default='isaac_joint_states')
 parser.add_argument('--headless', action='store_true')
 parser.add_argument('--livestream', action='store_true', help='headless + WebRTC stream (Isaac Sim WebRTC Streaming Client)')
 parser.add_argument('--no-table', action='store_true', help='robot only, no table and ground')
+parser.add_argument('--world', default='', help='USD scene saved from an earlier run (File > Save As), used instead '
+                    'of the table world; its robot and ROS 2 graph are replaced')
 parser.add_argument('--physics-hz', type=int, default=120)
 parser.add_argument('--render-hz', type=int, default=60, help='app loop rate limit, keeps sim close to real time')
 # USD angular drive units are per degree: 1047.2 Nm/deg = 6e4 Nm/rad, 52.36 Nms/deg = 3e3 Nms/rad
@@ -87,6 +90,7 @@ simulation_app.update()
 # Gazebo spawn: x=-0.2 y=-0.5 z=1.021 yaw=+90deg. Fuel 'Table' at (0, -0.84, 0): 1.5 x 0.8 x 0.03 top
 # centered at z=1.0, legs at (+-0.68, +-0.38). Sizes are approximate.
 GZ_ROBOT_XYZ = (-0.2, -0.5, 1.021)
+ROBOT_TAG = 'xarm_isaac:robot'
 
 
 def gz_to_robot(x, y, z):
@@ -140,15 +144,18 @@ def add_piece(stage, path, xy, color):
     UsdPhysics.MassAPI.Apply(cube.GetPrim()).CreateMassAttr(PIECE_MASS)
 
 
-def build_world(stage):
-    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
-    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
-    UsdGeom.Xform.Define(stage, '/World')
-
+def add_physics_scene(stage):
     scene = UsdPhysics.Scene.Define(stage, '/World/physicsScene')
     scene.CreateGravityDirectionAttr(Gf.Vec3f(0.0, 0.0, -1.0))
     scene.CreateGravityMagnitudeAttr(9.81)
     PhysxSchema.PhysxSceneAPI.Apply(scene.GetPrim()).CreateTimeStepsPerSecondAttr(args.physics_hz)
+
+
+def build_world(stage):
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    UsdGeom.Xform.Define(stage, '/World')
+    add_physics_scene(stage)
 
     UsdLux.DomeLight.Define(stage, '/World/DomeLight').CreateIntensityAttr(1000.0)
     sun = UsdLux.DistantLight.Define(stage, '/World/Sun')
@@ -167,6 +174,20 @@ def build_world(stage):
         add_bin(stage, '/World/Bins/Bin{}'.format(i), xy, color)
     for i, (xy, color) in enumerate(PIECES):
         add_piece(stage, '/World/Pieces/Piece{}'.format(i), xy, color)
+
+
+def load_world(path):
+    # A saved scene still holds the robot of its run, which references a USD in that run's temp dir,
+    # and the ROS 2 graph wired to it: both are removed and rebuilt from the current URDF
+    if not omni.usd.get_context().open_stage(path):
+        raise RuntimeError('cannot open world {}'.format(path))
+    stage = omni.usd.get_context().get_stage()
+    old_robots = [prim.GetPath() for prim in stage.Traverse() if prim.GetCustomDataByKey(ROBOT_TAG)]
+    for prim_path in old_robots + [Sdf.Path('/ActionGraph')]:
+        stage.RemovePrim(prim_path)
+    if not any(prim.IsA(UsdPhysics.Scene) for prim in stage.Traverse()):
+        add_physics_scene(stage)
+    return stage
 
 
 def import_robot(stage, urdf_path):
@@ -201,15 +222,16 @@ def import_robot(stage, urdf_path):
     return robot_path
 
 
-def find_articulation_root(stage):
-    for prim in stage.Traverse():
+# robot only, a loaded world may have articulations and joints of its own
+def find_articulation_root(stage, robot_path):
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_path)):
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             return prim.GetPath().pathString
     raise RuntimeError('no articulation root found after URDF import')
 
 
-def tune_joint_drives(stage):
-    for prim in stage.Traverse():
+def tune_joint_drives(stage, robot_path):
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_path)):
         if prim.IsA(UsdPhysics.RevoluteJoint):
             drive = UsdPhysics.DriveAPI.Apply(prim, 'angular')
         elif prim.IsA(UsdPhysics.PrismaticJoint):
@@ -368,12 +390,17 @@ def build_ros2_graph(stage, articulation_root, camera_path):
 
 
 def main():
-    stage = omni.usd.get_context().get_stage()
-    build_world(stage)
+    if args.world:
+        stage = load_world(args.world)
+    else:
+        stage = omni.usd.get_context().get_stage()
+        build_world(stage)
     robot_path = import_robot(stage, args.urdf)
+    # saved with the scene, tells load_world which prim to replace
+    stage.GetPrimAtPath(robot_path).SetCustomDataByKey(ROBOT_TAG, True)
     simulation_app.update()
-    tune_joint_drives(stage)
-    articulation_root = find_articulation_root(stage)
+    tune_joint_drives(stage, robot_path)
+    articulation_root = find_articulation_root(stage, robot_path)
     camera_path = None if args.no_camera else add_camera(stage, robot_path)
     build_ros2_graph(stage, articulation_root, camera_path)
     carb.log_info('xarm isaac: articulation {} on /{} and /{}, camera {}'.format(
