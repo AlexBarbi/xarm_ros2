@@ -139,7 +139,8 @@ MAX_LINE_STEP = 0.5                 # rad of any joint between two points of a s
                                     # arm over, not a line
 IK_ATTEMPTS = 5                     # the IK restarts from random seeds: some land on the arm reaching backwards
 MIN_ELBOW = -math.pi                # joint3 further than this: the elbow folded the other way, reachable but a long way
-CARRY_CLEARANCE = 0.015             # bottom of a carried piece above the bin rim and the pieces on the table
+CARRY_CLEARANCE = 0.035             # bottom of a carried piece above the bin rims and the pieces on the table
+RELEASE_CLEARANCE = 0.015           # bottom of a piece above the rim of its bin when let go: from higher it bounces out
 BIN_CORNER = 0.037                  # from the center of a bin, along x and y, to where a tall piece is dropped
 CORNERS = [(-1, 1), (1, 1), (-1, -1), (1, -1)]  # the arm comes from -y: the far ones first, it does not pass over them
 PIECE_MARGIN = 0.01                 # around the pieces on the table, for the planner
@@ -698,7 +699,7 @@ class PickAndPlace(Node):
         q = top_down(yaw + turn)
         self.move_to(make_pose(bin_x, bin_y, carry_z, q), 'over bin {}'.format(bin_index), CARRY_SPEED)
         # everything drops in from the rim: going lower would take the fingers over it, or into the bin
-        release_z = z + BIN_HEIGHT + CARRY_CLEARANCE
+        release_z = z + BIN_HEIGHT + RELEASE_CLEARANCE
         if carry_z > release_z:
             self.move_linear(make_pose(bin_x, bin_y, release_z, q), 'lower')
 
