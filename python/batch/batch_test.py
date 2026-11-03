@@ -9,10 +9,12 @@ happened from the true positions of the pieces, not from what the script says ab
   python3 batch_test.py --hours 2 --grip-torque 3.3 --out batch_results/torque_3.3   # another gripper force (30 N), to compare
 
 Results go in batch_results/<date>/, written after every run:
-  summary.md    the report: rates overall, by scenario and for each code, what got confused with what, the failed runs
+  summary.md    the report: rates overall, by scenario, by mold and for each code, the bins and how they were found,
+                what got confused with what, the failed runs
   pieces.csv    one row for each piece of each run
   runs.csv      one row for each run
   events.csv    what went wrong for each code (slips, empty grasps, losses)
+  bins.csv      one row for each true bin of each run: found or not, errors of center, size and rim, use, pieces in it
   logs/         the log of the runs that failed, and of the first few
 
 Scenarios: table (pieces at random, on the table), tipped (the same, many on their side), touching (pairs of pieces in
@@ -52,12 +54,15 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 from piece_vision import mold_parts  # noqa: E402
 SCENARIOS = ('scene', 'table', 'tipped', 'touching', 'belt')
-RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'bins_true', 'bins_found', 'bin_error_mm', 'status', 'exit', 'pieces', 'ok', 'wrong_bin', 'on_table',
+RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'bins_true', 'bins_found', 'bin_error_mm',
+              'bin_size_error_mm', 'bin_rim_error_mm', 'survey_s', 'status', 'exit', 'pieces', 'ok', 'wrong_bin', 'on_table',
               'lost', 'robot_s', 'wall_s', 'real_time_factor', 'in_window', 'drops', 'silent_failure', 'false_alarm',
               'straight_lines', 'around', 'moveit_errors']
 PIECE_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'piece', 'code', 'target_bin', 'outcome', 'where', 'rejected', 'said',
                 'recognition', 'seen_mm', 'grasp_found', 'x', 'y', 'over_rim_mm']
 EVENT_FIELDS = ['run', 'scenario', 'noise', 'code', 'kind', 'count']
+BIN_FIELDS = ['run', 'mold', 'bin', 'x', 'y', 'inner_x_mm', 'inner_y_mm', 'rim_mm', 'found', 'center_error_mm', 'size_error_mm',
+              'rim_error_mm', 'use', 'pieces_in', 'pieces_right']
 MAX_JOINT4 = 3.2                # rad: past its stop it has torn loose, even if the fingers are still somewhere near
 MIN_FINGER = -0.1               # rad of drive_joint: the same, it stops at 0
 MAX_TRACKING = 0.5              # rad between where an arm joint is told to be and where it is, for half a second: the
@@ -71,6 +76,7 @@ PLACED = re.compile(r'^(\d{12}) placed,')
 BIN_LINE = re.compile(r'^bin (\d+): (\d+) x (\d+) mm inside, rim (\d+) mm, at \((-?[\d.]+), (-?[\d.]+)\)')
 MOLD_LINE = re.compile(r'^mold \d+: (.*), unknown pieces into bin (\d+)$')
 BIN_MATCH = 0.05                # m between a bin the sorter found and a true one, to be the same
+STAMP = re.compile(r'^\[\w+\] \[([\d.]+)\]')
 DONE = re.compile(r'^done: (\d+) dropped into the bins, (?:\d+ into the reject bin, )?(\d+) on the table, (\d+) lost, ([\d.]+) s')
 EVENT_KINDS = (('slipped out', 'slip'), ('may have fallen', 'closed_in_transport'), ('lost during', 'lost_in_transport'),
                ('nothing between', 'empty_grasp'),
@@ -115,20 +121,27 @@ def parse_log(text):
     drops = collections.Counter()
     done = None
     bins, assigned, reject = {}, {}, None
+    first_stamp, survey = None, ''
     first_look = True
     for line in text.splitlines():
+        stamp = STAMP.match(line)
+        if stamp and first_stamp is None:
+            first_stamp = float(stamp.group(1))
         match = LOG_LINE.match(line)
         if not match:
             continue
         message = match.group(1)
         found = BIN_LINE.match(message)
         if found:
-            bins[int(found.group(1))] = (float(found.group(5)), float(found.group(6)), int(found.group(2)), int(found.group(3)))
+            bins[int(found.group(1))] = (float(found.group(5)), float(found.group(6)), int(found.group(2)), int(found.group(3)),
+                                         int(found.group(4)))
             continue
         mold = MOLD_LINE.match(message)
         if mold:
             assigned = {n: int(b) for n, b in re.findall(r'(\d{12}) into bin (\d+)', mold.group(1))}
             reject = int(mold.group(2))
+            if stamp and survey == '':
+                survey = round(float(stamp.group(1)) - first_stamp, 1)     # wall clock, from the start to the bins found
             continue
         if message.startswith('above piece'):
             first_look = False
@@ -157,7 +170,7 @@ def parse_log(text):
             kind = next((k for text_, k in EVENT_KINDS if text_ in coded.group(2)), 'other')
             events[(coded.group(1), kind)] += 1
     return {'seen': seen, 'events': events, 'counts': counts, 'drops': drops, 'done': done, 'bins': bins,
-            'assigned': assigned, 'reject': reject}
+            'assigned': assigned, 'reject': reject, 'survey_s': survey}
 
 
 def where_is(piece, bins):
@@ -185,17 +198,36 @@ def where_is(piece, bins):
 def true_bin_of(log, bins):
     """Bin number of the sorter -> number of the true bin it found, or -1 if it is none of them."""
     match = {}
-    for index, (x, y, _, _) in log['bins'].items():
+    for index, (x, y, *_) in log['bins'].items():
         distances = [math.dist((x, y), b['center']) for b in bins]
         match[index] = distances.index(min(distances)) if distances and min(distances) < BIN_MATCH else -1
     return match
 
 
-def bin_check(log, bins):
-    """(how many true bins the sorter found, worst error of their centers [mm])"""
-    errors = [min((math.dist((x, y), b['center']) for x, y, _, _ in log['bins'].values()), default=1.0) for b in bins]
-    hits = [e for e in errors if e < BIN_MATCH]
-    return len(hits), round(max(hits) * 1000, 1) if hits else ''
+def bin_rows(log, bins, rows, table_z):
+    """For each true bin: whether the sorter found it, how far off it was, what it used it for and what went in."""
+    match = true_bin_of(log, bins)
+    uses = collections.defaultdict(list)
+    for code, index in log['assigned'].items():
+        uses[match.get(index, -1)].append(code[-5:])
+    reject = match.get(log['reject'], -2)
+    out = []
+    for i, b in enumerate(bins):
+        found = [log['bins'][k] for k, t in match.items() if t == i]
+        row = {'bin': i, 'x': round(b['center'][0], 3), 'y': round(b['center'][1], 3), 'inner_x_mm': round(b['inner'][0] * 1000),
+               'inner_y_mm': round(b['inner'][1] * 1000), 'rim_mm': round((b['rim'] - table_z) * 1000), 'found': int(bool(found)),
+               'center_error_mm': '', 'size_error_mm': '', 'rim_error_mm': '',
+               'use': ' '.join(uses[i]) or ('scarti' if i == reject else 'libera'),
+               'pieces_in': sum(r['where'] == 'bin {}'.format(i) for r in rows),
+               'pieces_right': sum(r['where'] == 'bin {}'.format(i) and r['outcome'] == 'ok' for r in rows)}
+        if found:
+            x, y, length, width, rim = found[0]
+            row['center_error_mm'] = round(math.dist((x, y), b['center']) * 1000, 1)
+            true_size = sorted((row['inner_x_mm'], row['inner_y_mm']))
+            row['size_error_mm'] = max(abs(a - t) for a, t in zip(sorted((length, width)), true_size))
+            row['rim_error_mm'] = abs(rim - row['rim_mm'])
+        out.append(row)
+    return out
 
 
 def judge(start, end, log, bins):
@@ -281,6 +313,7 @@ def write_report(folder, command=''):
     runs = read_rows(folder / 'runs.csv')
     pieces = read_rows(folder / 'pieces.csv')
     events = read_rows(folder / 'events.csv')
+    bins = read_rows(folder / 'bins.csv')
     judged = [r for r in runs if r['status'] != 'infrastructure']
     out = ['# Batch del selezionatore', '']
     if command:
@@ -292,12 +325,19 @@ def write_report(folder, command=''):
     rejected = sum(p.get('rejected') == '1' for p in pieces)
     with_bins = [r for r in judged if r.get('bins_true')]
     all_bins = sum(r['bins_found'] == r['bins_true'] for r in with_bins)
-    worst = max((float(r['bin_error_mm']) for r in with_bins if r['bin_error_mm']), default=0.0)
+
+    def worst(field):
+        values = [float(r[field]) for r in with_bins if r.get(field)]
+        return '{:.0f} mm'.format(max(values)) if values else '-'
+    surveys = [float(r['survey_s']) for r in with_bins if r.get('survey_s')]
     out += ['## In sintesi', '',
             '- **Pezzi nel contenitore giusto: {}**, {} su {}.'.format(rate(ok, len(pieces)), ok, len(pieces)),
             '- Nel contenitore degli scarti: {}. Il batch usa solo codici noti, quindi ognuno è un pezzo non riconosciuto, '
             'contato tra i bin sbagliati.'.format(rejected),
-            '- Casse trovate tutte in {} corse su {}; errore massimo del centro {:.0f} mm.'.format(all_bins, len(with_bins), worst),
+            '- Casse trovate tutte in {} corse su {}. Errore massimo: centro {}, misure interne {}, bordo {}. '
+            'Ricerca delle casse all\'avvio: {} reali in media.'.format(
+                all_bins, len(with_bins), worst('bin_error_mm'), worst('bin_size_error_mm'), worst('bin_rim_error_mm'),
+                '{:.0f} s'.format(sum(surveys) / len(surveys)) if surveys else '-'),
             '- Corse perfette: {}, {} su {}.'.format(rate(clean, len(judged)), clean, len(judged)),
             '- Tempo robot per pezzo: {:.1f} s simulati. Corse: {:.1f} ore reali in tutto.'.format(
                 robot / len(pieces) if pieces else 0.0, wall / 3600),
@@ -330,6 +370,44 @@ def write_report(folder, command=''):
     out += ['## Per scenario', '']
     out += table(['Scenario', 'Rumore', 'Pinza', 'Corse', 'Pezzi', 'Nel bin giusto', 'Corse perfette', 'Riconosciuti',
                   's robot/pezzo', 'Entro la finestra'], rows)
+    by_mold = collections.defaultdict(list)
+    for r in judged:
+        by_mold[r.get('mold', '')].append(r)
+    rows = []
+    for mold, group in sorted(by_mold.items()):
+        names = set(r['run'] for r in group)
+        part = [p for p in pieces if p['run'] in names]
+        rows.append([mold or '-', ' '.join(sorted(set(p['code'][-5:] for p in part))), len(group), len(part),
+                     rate(sum(p['outcome'] == 'ok' for p in part), len(part)),
+                     percent(sum(p['recognition'] == 'right' for p in part), len(part)),
+                     sum(p.get('rejected') == '1' for p in part), percent(sum(r['ok'] == r['pieces'] for r in group), len(group))])
+    out += ['## Per stampo', '']
+    out += table(['Stampo', 'Codici arrivati', 'Corse', 'Pezzi', 'Nel bin giusto', 'Riconosciuti', 'Negli scarti', 'Corse perfette'], rows)
+    if bins:
+        by_bin = collections.defaultdict(list)
+        for b in bins:
+            by_bin[int(b['bin'])].append(b)
+        rows = []
+        for index, group in sorted(by_bin.items()):
+            found = [b for b in group if b['found'] == '1']
+
+            def stat(field, how):
+                values = [float(b[field]) for b in found if b[field] != '']
+                return '{:.1f}'.format(how(values)) if values else '-'
+            uses = collections.Counter(b['use'] for b in group)
+            first = group[0]
+            rows.append([index, '({}, {})'.format(first['x'], first['y']), '{} x {}'.format(first['inner_x_mm'], first['inner_y_mm']),
+                         first['rim_mm'], '{}/{}'.format(len(found), len(group)),
+                         stat('center_error_mm', lambda v: sum(v) / len(v)), stat('center_error_mm', max),
+                         stat('size_error_mm', max), stat('rim_error_mm', max),
+                         ', '.join('{} ({})'.format(u, n) for u, n in uses.most_common()),
+                         sum(int(b['pieces_in']) for b in group), sum(int(b['pieces_right']) for b in group)])
+        out += ['## Casse', '',
+                'Le casse vere della scena, e come le ha trovate il robot all\'avvio. Uso: a cosa le ha destinate, con quante '
+                'corse; i codici sono le ultime cinque cifre.', '']
+        out += table(['Cassa', 'Centro (m)', 'Interno (mm)', 'Bordo (mm)', 'Trovata', 'Errore centro medio (mm)',
+                      'Errore centro max (mm)', 'Errore misure max (mm)', 'Errore bordo max (mm)', 'Uso', 'Pezzi entrati',
+                      'Di cui giusti'], rows)
     by_code = collections.defaultdict(list)
     for p in pieces:
         by_code[p['code']].append(p)
@@ -495,6 +573,7 @@ class Batch:
         (self.folder / 'logs').mkdir(parents=True, exist_ok=True)
         self.python = HERE.parent
         sorter = sorter_constants(self.python / 'pick_and_place.py')
+        self.table_z = sorter['TABLE_TOP_Z']
         self.models = Path(args.workspace) / 'shared' / 'piece_models.json'
         parts = mold_parts(self.models)
         self.molds = args.molds.split(',') if args.molds else sorted(parts)
@@ -510,7 +589,7 @@ class Batch:
         self.done = set(r['run'] for r in read_rows(self.folder / 'runs.csv'))
         self.runs_since_start = 0
         self.kept_logs = 0
-        for name, fields in (('runs', RUN_FIELDS), ('pieces', PIECE_FIELDS), ('events', EVENT_FIELDS)):
+        for name, fields in (('runs', RUN_FIELDS), ('pieces', PIECE_FIELDS), ('events', EVENT_FIELDS), ('bins', BIN_FIELDS)):
             path = self.folder / '{}.csv'.format(name)
             if not path.exists():
                 with open(path, 'w', newline='') as f:
@@ -622,14 +701,18 @@ class Batch:
     def record(self, spec, status, code, start, before, end, wall, log_path):
         log = parse_log(log_path.read_text(errors='replace'))
         rows = judge(start, end, log, start['bins'])
-        bins_found, bin_error = bin_check(log, start['bins'])
+        bins = bin_rows(log, start['bins'], rows, self.table_z)
+        found = [b for b in bins if b['found']]
         tally = collections.Counter(r['outcome'] for r in rows)
         robot = end['t'] - before['t']
         window = ''
         if spec['scenario'] == 'belt':
             window = int(robot <= self.args.belt_window and tally['ok'] == len(rows))
         all_ok = tally['ok'] == len(rows) and bool(rows)
-        result = dict(spec, bins_true=len(start['bins']), bins_found=bins_found, bin_error_mm=bin_error,
+        result = dict(spec, bins_true=len(bins), bins_found=len(found),
+                      bin_error_mm=max((b['center_error_mm'] for b in found), default=''),
+                      bin_size_error_mm=max((b['size_error_mm'] for b in found), default=''),
+                      bin_rim_error_mm=max((b['rim_error_mm'] for b in found), default=''), survey_s=log['survey_s'],
                       status=status, exit='' if code is None else code, pieces=len(rows), ok=tally['ok'],
                       wrong_bin=tally['wrong_bin'], on_table=tally['on_table'], lost=tally['lost'],
                       robot_s=round(robot, 1), wall_s=round(wall, 1), real_time_factor=round(robot / max(wall, 1e-3), 2),
@@ -640,6 +723,7 @@ class Batch:
         self.append('runs', RUN_FIELDS, [result])
         self.append('pieces', PIECE_FIELDS, [dict(r, run=spec['run'], scenario=spec['scenario'], noise=spec['noise'],
                                                   gripper=spec['gripper'], seed=spec['seed'], mold=spec['mold']) for r in rows])
+        self.append('bins', BIN_FIELDS, [dict(b, run=spec['run'], mold=spec['mold']) for b in bins])
         self.append('events', EVENT_FIELDS, [{'run': spec['run'], 'scenario': spec['scenario'], 'noise': spec['noise'], 'code': c,
                                               'kind': k, 'count': n} for (c, k), n in sorted(log['events'].items())])
         if all_ok and status == 'done' and self.kept_logs >= self.args.keep_logs:
