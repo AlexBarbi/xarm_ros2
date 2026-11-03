@@ -20,6 +20,8 @@ Il codice cerca `shared/` dentro `ros_ws`. Dopo aver clonato il repo in `ros_ws/
 ```bash
 cd ~/Downloads/ros_ws
 ln -s src/xarm_ros2/shared shared          # lo stesso link di questo PC
+setfacl -m u:1234:rwx,d:u:1234:rwx,d:u:$USER:rwx src/xarm_ros2/shared   # Isaac nel container (utente 1234) ci scrive
+setfacl -m u:1234:rw src/xarm_ros2/shared/world.usd
 cp -r "/percorso/Studio selezionatore oggetti Volpiano" shared/
 ```
 

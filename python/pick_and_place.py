@@ -28,6 +28,7 @@ Usage:
 
 import argparse
 import math
+import os
 import sys
 import threading
 import time
@@ -130,6 +131,7 @@ ROBOT_KEEP_OUT = (0.0, 0.0, 0.14)
 MODELS = 'shared/piece_models.json'
 BELT_FILE = 'shared/.conveyor_belt'     # what the belt of shared/conveyor_cycle.py is doing: moving, stopped or off
 ROBOT_FILE = 'shared/.conveyor_robot'   # what this script is doing, for the belt: waiting, working or done
+BELT_SILENCE = 120.0                    # s of wall clock without a new round of the belt before saying what may be wrong
 
 # ---------------------------------------------------------------- motion
 SCAN_XYZ = (-0.377, -0.242, 0.397)  # TCP, gripper pointing down: the camera sees 77% of the work area from here
@@ -934,9 +936,18 @@ class PickAndPlace(Node):
         last = None                 # the number of the round, not the moving in between, which can pass unseen
         placed = 0
         rounds = 0
+        waiting_since = time.monotonic()
         try:
             while True:
                 belt = self.belt_says()
+                if time.monotonic() - waiting_since > BELT_SILENCE:
+                    waiting_since = time.monotonic()
+                    self.get_logger().warn(
+                        'still waiting for the belt, {} says {}. If the belt is stopped in Isaac Sim: it writes that file next to '
+                        'the world.usd it plays, so open /workspace/world.usd; its container user must be able to write there '
+                        '(setfacl -m u:1234:rwx,d:u:1234:rwx shared, from ros_ws); and Isaac Sim must have started with '
+                        '--/app/scripting/ignoreWarningDialog=true, or the belt script does not run'.format(
+                            os.path.abspath(BELT_FILE), ' '.join(belt) or 'nothing (not there)'))
                 if belt[:1] == ['off']:
                     last = None         # Stop in Isaac Sim: its script may start counting again
                 if belt[:1] == ['stopped'] and belt[1] != last:
@@ -950,6 +961,7 @@ class PickAndPlace(Node):
                         self.get_logger().error('round {}: {}'.format(last, e))
                     self.tell_belt('done', last)
                     self.get_logger().info('{} rounds, {} pieces dropped into the bins so far'.format(rounds, placed))
+                    waiting_since = time.monotonic()
                 time.sleep(0.1)
         finally:
             Path(ROBOT_FILE).unlink(missing_ok=True)    # gone: the belt goes on by itself

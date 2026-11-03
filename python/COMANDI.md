@@ -12,6 +12,8 @@ git clone --recursive -b jazzy https://github.com/AlexBarbi/xarm_ros2.git
 cd ~/Downloads/ros_ws
 ln -s src/xarm_ros2/shared shared                                    # il codice e il container cercano ros_ws/shared
 cp -r "/percorso/Studio selezionatore oggetti Volpiano" shared/       # i CAD dei pezzi non sono nel repo
+setfacl -m u:1234:rwx,d:u:1234:rwx,d:u:$USER:rwx src/xarm_ros2/shared  # Isaac nel container è l'utente 1234: deve scriverci
+setfacl -m u:1234:rw src/xarm_ros2/shared/world.usd                     # e poter salvare la scena
 rosdep install --from-paths src --ignore-src --rosdistro jazzy -y
 colcon build
 ```
@@ -129,6 +131,17 @@ I risultati vanno in `batch_results/<data_ora>/` e si aggiornano dopo ogni corsa
 - `logs/`: i log delle corse fallite e delle prime riuscite.
 
 Le corse con stato **Simulazione esplosa** sono quelle in cui il meccanismo della pinza simulata si è strappato. È un problema di Isaac, non del programma: valutale a parte.
+
+## Se qualcosa non va
+
+**`--conveyor` resta su `waiting for the belt to stop` con il nastro fermo.** Lo script del nastro scrive il suo stato in `shared/.conveyor_belt`, e il robot aspetta quel file. Dopo 2 minuti lo script stampa cosa contiene. Le cause, in ordine:
+
+1. **Isaac non può scrivere in `shared/`.** Nella console di Isaac compare `conveyor: cannot write .conveyor_belt: Permission denied`. Rimedio: i due `setfacl` del punto 0, poi Stop e Play in Isaac.
+2. **Il container monta un'altra cartella**, per esempio perché è stato creato prima del link `shared`. Confronta `docker exec isaac-sim ls -la /workspace` con `ls -la shared/`. Se sono diverse: `docker restart isaac-sim`, oppure ricrea il container con il `docker run` del punto 0.
+3. **world.usd aperto da un altro percorso.** Il nastro scrive accanto al file aperto: va aperto `/workspace/world.usd`.
+4. **Lo script del nastro non gira**, e non cadono pezzi: Isaac è partito senza `--/app/scripting/ignoreWarningDialog=true`.
+
+Per vedere cosa si dicono nastro e robot: `cat shared/.conveyor_belt shared/.conveyor_robot`.
 
 ## Forza della pinza in world.usd
 
