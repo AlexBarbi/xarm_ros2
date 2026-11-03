@@ -45,7 +45,7 @@ BELT_SPEED = 'physxSurfaceVelocity:surfaceVelocity'
 GRIPPER = '/World/xarm5/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link'
 FINGERS = (GRIPPER + '/left_outer_knuckle/left_finger', GRIPPER + '/right_outer_knuckle/right_finger')
 GRIPPER_DRIVE = '/World/xarm5/Physics/drive_joint'
-RIM_Z = CONFIG['rim_z']         # top of the bins: under it their walls hold a piece
+BINS_PATH = '/World/Bins'
 PARK = (3.0, 3.0, -0.98)        # on the ground, far from everything
 SETTLE_FRAMES = 150             # after Play, for the pieces to come to rest
 BELT_PIECES = 5                 # a round of the conveyor
@@ -209,7 +209,7 @@ def snapshot(stage):
         if name not in pieces:
             pieces[name] = Piece(prim)
             active.append(name)
-    out = {'t': timeline.get_current_time(), 'pieces': {}, 'fingers': []}
+    out = {'t': timeline.get_current_time(), 'pieces': {}, 'fingers': [], 'bins': BINS}
     for path in FINGERS:
         d = physx.get_rigidbody_transformation(path)
         if d['ret_val']:
@@ -220,7 +220,7 @@ def snapshot(stage):
         if not d['ret_val'] or not len(piece.points):
             continue
         w = turned_points(piece, d['position'], d['rotation'])
-        below = w[w[:, 2] < RIM_Z]
+        below = w[w[:, 2] < RIM_Z]       # under the rims: the walls of a bin hold that part
         out['pieces'][name] = {
             'number': piece.number, 'low': w.min(axis=0).tolist(), 'high': w.max(axis=0).tolist(),
             'mean': w.mean(axis=0).tolist(),
@@ -253,6 +253,24 @@ if CONFIG.get('grip_torque'):
         stage.GetPrimAtPath(GRIPPER_DRIVE).GetAttribute('drive:angular:physics:maxForce').Set(float(CONFIG['grip_torque']))
 print('gripper motor:', stage.GetPrimAtPath(GRIPPER_DRIVE).GetAttribute('drive:angular:physics:maxForce').Get(), 'N*m', flush=True)
 add_copies(stage)
+
+
+def true_bins(stage):
+    """The bins of the stage, as they are: center, inside size and rim, for the judge."""
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    found = []
+    for prim in stage.GetPrimAtPath(BINS_PATH).GetChildren():
+        box = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+        walls = [cache.ComputeWorldBound(c).ComputeAlignedRange() for c in prim.GetChildren() if c.GetName().startswith('Wall')]
+        wall = min(min(w.GetMax()[0] - w.GetMin()[0], w.GetMax()[1] - w.GetMin()[1]) for w in walls) if walls else 0.0
+        found.append({'center': [(box.GetMin()[0] + box.GetMax()[0]) / 2, (box.GetMin()[1] + box.GetMax()[1]) / 2],
+                      'inner': [box.GetMax()[0] - box.GetMin()[0] - 2 * wall, box.GetMax()[1] - box.GetMin()[1] - 2 * wall],
+                      'rim': box.GetMax()[2]})
+    return found
+
+
+BINS = true_bins(stage)
+RIM_Z = max(b['rim'] for b in BINS)
 pieces = {p.GetName(): Piece(p) for p in stage.GetPrimAtPath(PIECES_PATH).GetChildren()}
 active = []
 timeline = omni.timeline.get_timeline_interface()

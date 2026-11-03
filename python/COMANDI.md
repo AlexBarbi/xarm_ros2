@@ -73,7 +73,7 @@ python3 src/xarm_ros2/python/pick_and_place.py                # smista quello ch
 python3 src/xarm_ros2/python/pick_and_place.py --conveyor     # segue il nastro giro dopo giro, fino a Ctrl-C
 ```
 
-All'avvio scrive cosa ha trovato: `gripper: …`, `camera: …` e lo stampo con i suoi contenitori.
+All'avvio guarda intorno per trovare le casse, poi scrive cosa ha trovato: `gripper: …`, `camera: …`, una riga `bin N: …` per cassa e lo stampo con le sue casse.
 
 **Stampo.** Il nastro fa cadere solo i pezzi dello stampo scritto in `shared/mold.txt`, e il robot cerca solo quei codici. Per cambiarlo, anche mentre gira (vale dal giro dopo):
 
@@ -82,7 +82,7 @@ python3 src/xarm_ros2/python/pick_and_place.py --conveyor --mold 940017355
 echo 940017355 > shared/mold.txt                                   # oppure così
 ```
 
-Stampi: 940016506, 940016509, 940017355, 940017433. I loro codici vanno nei contenitori 0, 1, 2; il 3 è degli scarti.
+Stampi: 940016506, 940016509, 940017355, 940017433. I loro codici vanno nelle prime casse (prima quelle a sinistra, dalla più vicina al robot); l'ultima è degli scarti.
 
 Con il rumore della camera, in un quarto terminale:
 

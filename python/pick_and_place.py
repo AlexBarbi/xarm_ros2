@@ -6,7 +6,9 @@ Sort the pieces on the table of shared/world.usd into their bins with MoveIt 2, 
 Nothing about the pieces is given: one depth image of the table is enough to find them, piece_vision.py recognizes
 each part number from the CAD (shared/piece_models.json) and works out where to hold it. The pieces that come are the
 parts of one mold, the one written in shared/mold.txt (the belt reads it too): its part numbers go into bins 0, 1, 2 in
-the order of their numbers, unknown pieces into REJECT_BIN. The table is scanned again until no piece is left on it.
+the order of their numbers, unknown pieces into the last bin. Where the bins are, how many and how large, the robot finds
+out at the start, looking around: nothing about them is written here. The table is scanned again until no piece is left
+on it.
 
 The arm goes from point to point the shortest way: along the straight line when the IK can follow it, planned around
 what blocks it otherwise, and always with the fewest turns of the joints. The table and the bins are behind the base,
@@ -59,11 +61,10 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from piece_vision import FINGER_MARGIN, MAX_GAP, PieceLibrary, TableMap, finger_position, mold_bins
+from piece_vision import FINGER_MARGIN, MAX_GAP, PieceLibrary, TableMap, finger_position, mold_bins, mold_parts
 
 # ---------------------------------------------------------------- what goes where
 MOLD_FILE = os.environ.get('MOLD_FILE', 'shared/mold.txt')  # the mold in production: its parts are what comes on the belt
-REJECT_BIN = 3                      # unknown pieces that can be held go here, the parts of the mold into the other bins
 
 # ---------------------------------------------------------------- robot
 FRAME = 'link_base'                 # every position below is in this frame
@@ -106,12 +107,16 @@ TABLE_TOP_Z = -0.006                # surface the pieces and the bins stand on
 TABLE_SIZE = (0.8, 1.5, 0.03)
 TABLE_CENTER_XY = (-0.34, -0.2)
 
-# open bins, two on each side of the belt: centers, inner size, outer height, wall/floor thickness
-BINS_XY = [(-0.20, 0.27), (-0.45, 0.27), (-0.20, -0.27), (-0.45, -0.27)]
-BIN_BOTTOM_Z = TABLE_TOP_Z
-BIN_INNER = (0.22, 0.17)            # x, y
-BIN_HEIGHT = 0.12
-BIN_WALL = 0.008
+# The bins are found at the start: looked for in SURVEY_X x SURVEY_Y, from SURVEY_VIEWS. They are numbered on the left
+# (y > 0) from the nearest to the robot, then on the right the same way; the parts of the mold go into the first ones, the
+# pieces nobody knows into the last one.
+SURVEY_X = (-0.80, 0.06)
+SURVEY_Y = (-0.60, 0.60)
+# TCP x, y, yaw at the scan height: the camera over (-0.30, +-0.25) and (-0.45, +-0.25), turned so that it is further out
+# than the TCP, where the arm still reaches. At the height of the rims an image covers less than on the table: from one
+# view on each side the wall of a bin nearest to the robot was out of it, and the bin not closed.
+SURVEY_VIEWS = [(-0.2675, 0.1825, math.pi / 2), (-0.4175, 0.1825, math.pi / 2),
+                (-0.3325, -0.1825, -math.pi / 2), (-0.4825, -0.1825, -math.pi / 2)]
 
 # where the camera looks for pieces: the belt (x -1.70..-0.16, y -0.10..0.10 in world.usd) from a little further than the
 # arm reaches (-0.66), so that the last piece of a round is seen whole, and a little on its sides, up to the bins, without
@@ -149,8 +154,7 @@ MIN_ELBOW = -math.pi                # joint3 further than this: the elbow folded
 TRAVEL_CLEARANCE = 0.06             # TCP above the bin rims and what stands in them, going for a piece
 CARRY_CLEARANCE = 0.035             # bottom of a carried piece above the bin rims and the pieces on the table
 RELEASE_CLEARANCE = 0.015           # bottom of a piece above the rim of its bin when let go: from higher it bounces out
-BIN_CORNER = 0.037                  # from the center of a bin, along x and y, to where a tall piece is dropped
-CORNERS = [(-1, 1), (1, 1), (-1, -1), (1, -1)]  # the arm comes from -y: the far ones first, it does not pass over them
+BIN_CORNER_GAP = 0.02               # m from the inner walls of a bin to where a tall piece is dropped
 PIECE_MARGIN = 0.01                 # around the pieces on the table, for the planner
 NEIGHBOR_GAP = 0.03                 # pieces closer than this to the one being taken: room for the fingers comes from the map
 PLANNING_TIME = 2.0
@@ -158,6 +162,7 @@ GRASP_ATTEMPTS = 3                  # grasps of a piece in a row: when one misse
 MAX_ROUNDS = 4                      # scans of the table with something left to do
 
 PIECE_PREFIX = 'piece'
+BIN_PREFIX = 'bin'
 TABLE_ID = 'table'
 
 
@@ -203,12 +208,14 @@ class PickAndPlace(Node):
         self.get_scene_client = self.create_client(GetPlanningScene, 'get_planning_scene')
         self.mold = None
         self.piece_bins = {}                        # part number -> bin, of the mold
+        self.reject_bin = None
+        self.bins = []                              # found at the start, piece_vision.Bin
         self.library = None
         self.load_mold(mold)
         self.joints = {}
         self.joints_stamp = 0.0
         self.joint_limits = {}
-        self.tall_in_bin = [0] * len(BINS_XY)
+        self.tall_in_bin = []
         self.bin_top = 0.0                          # height above the table of the tallest piece standing in a bin
         self.create_subscription(String, 'robot_description', self.on_robot_description,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -247,14 +254,23 @@ class PickAndPlace(Node):
                 raise RuntimeError('no mold: {} ({}), give one with --mold'.format(MOLD_FILE, e))
         if mold == self.mold:
             return
+        parts = mold_parts(MODELS)
+        if mold not in parts:
+            raise RuntimeError('mold {} unknown, the ones in {}: {}'.format(mold, MODELS, ', '.join(sorted(parts))))
+        self.library = PieceLibrary(MODELS, parts[mold])
+        self.mold = mold
+        if self.bins:
+            self.assign_bins()
+
+    def assign_bins(self):
+        """The parts of the mold into the first bins, the unknown pieces into the last one."""
         try:
-            self.piece_bins = mold_bins(MODELS, mold, len(BINS_XY), REJECT_BIN)
+            self.piece_bins = mold_bins(MODELS, self.mold, len(self.bins))
         except ValueError as e:
             raise RuntimeError(str(e))
-        self.library = PieceLibrary(MODELS, list(self.piece_bins))
-        self.mold = mold
+        self.reject_bin = len(self.bins) - 1
         self.get_logger().info('mold {}: {}, unknown pieces into bin {}'.format(
-            mold, ', '.join('{} into bin {}'.format(n, b) for n, b in self.piece_bins.items()), REJECT_BIN))
+            self.mold, ', '.join('{} into bin {}'.format(n, b) for n, b in self.piece_bins.items()), self.reject_bin))
 
     def on_robot_description(self, msg):
         for joint in ET.fromstring(msg.data).iter('joint'):
@@ -372,10 +388,11 @@ class PickAndPlace(Node):
         return co
 
     def bin_object(self, index):
-        lx, ly = BIN_INNER
-        t, h = BIN_WALL, BIN_HEIGHT
+        found = self.bins[index]
+        lx, ly, t, h = found.length, found.width, found.wall, found.rim
         return self.collision_object(
-            'bin{}'.format(index), make_pose(BINS_XY[index][0], BINS_XY[index][1], BIN_BOTTOM_Z),
+            '{}{}'.format(BIN_PREFIX, index), make_pose(found.center[0], found.center[1], TABLE_TOP_Z,
+                                                        Quaternion(z=math.sin(found.angle / 2), w=math.cos(found.angle / 2))),
             box((lx + 2 * t, ly + 2 * t, t), make_pose(0, 0, t / 2)),                 # floor
             box((t, ly + 2 * t, h), make_pose(+(lx + t) / 2, 0, h / 2)),              # walls
             box((t, ly + 2 * t, h), make_pose(-(lx + t) / 2, 0, h / 2)),
@@ -764,7 +781,7 @@ class PickAndPlace(Node):
         obj = self.piece_object(piece)
         self.gripper(finger_position(min(grasp.width + 2 * FINGER_MARGIN, MAX_GAP)), 'open', wait=False)
         # at the height of the rims the straight line back from a bin grazes the bins on the way, so down only over the piece
-        travel = max(above, TABLE_TOP_Z + max(BIN_HEIGHT, self.bin_top) + TRAVEL_CLEARANCE)
+        travel = max(above, TABLE_TOP_Z + max(self.bin_rim(), self.bin_top) + TRAVEL_CLEARANCE)
         self.move_to(make_pose(grasp.x, grasp.y, travel, q), 'above piece', FREE_SPEED)
         # The fingers go around it, and next to the pieces it touches: the height map has room for them there, the boxes
         # of those with the margin for the planner do not, and the piece in the gripper would start in collision with them.
@@ -793,7 +810,7 @@ class PickAndPlace(Node):
             self.neighbors = []
 
     def carry_to_bin(self, piece, grasp, bin_index, tallest_left, z, yaw):
-        carry_z = z + max(BIN_HEIGHT, self.bin_top, tallest_left) + CARRY_CLEARANCE
+        carry_z = z + max(self.bin_rim(), self.bin_top, tallest_left) + CARRY_CLEARANCE
         try:
             self.move_linear(make_pose(grasp.x, grasp.y, carry_z, top_down(yaw)), 'lift')
             self.check_grip_at_rest('lift')     # still over the table: after this, the fingers never open before the bin
@@ -811,17 +828,48 @@ class PickAndPlace(Node):
         q = top_down(yaw + turn)
         self.move_to(make_pose(bin_x, bin_y, carry_z, q), 'over bin {}'.format(bin_index), CARRY_SPEED)
         # everything drops in from the rim: going lower would take the fingers over it, or into the bin
-        release_z = z + BIN_HEIGHT + RELEASE_CLEARANCE
+        release_z = z + self.bins[bin_index].rim + RELEASE_CLEARANCE
         if carry_z > release_z:
             self.move_linear(make_pose(bin_x, bin_y, release_z, q), 'lower')
 
+    def bin_rim(self):
+        """Top of the highest bin above the table: what the arm passes over."""
+        return max(found.rim for found in self.bins)
+
     def bin_spot(self, piece, bin_index):
-        """Low pieces land in the middle of a bin. Tall ones in a corner: in the middle they fall over and lean out of it."""
-        x, y = BINS_XY[bin_index]
-        if piece.height <= BIN_HEIGHT:
+        """Low pieces land in the middle of a bin. Tall ones in a corner: in the middle they fall over and lean out of it.
+        The corners far from the robot first: the arm then does not pass over what stands in them."""
+        found = self.bins[bin_index]
+        x, y = found.center
+        if piece.height <= found.rim:
             return x, y
-        side_x, side_y = CORNERS[self.tall_in_bin[bin_index] % len(CORNERS)]
-        return x + side_x * BIN_CORNER, y + side_y * BIN_CORNER
+        c, s = math.cos(found.angle), math.sin(found.angle)
+        du, dv = max(found.length / 2 - BIN_CORNER_GAP, 0.0), max(found.width / 2 - BIN_CORNER_GAP, 0.0)
+        corners = sorted(((x + u * c - v * s, y + u * s + v * c) for u in (-du, du) for v in (-dv, dv)),
+                         key=lambda corner: -math.hypot(*corner))
+        return corners[self.tall_in_bin[bin_index] % len(corners)]
+
+    def find_bins(self):
+        """How many bins there are, where and how large: looking from above at both sides of the belt and over it."""
+        objects = self.call(self.get_scene_client, GetPlanningScene.Request(components=PlanningSceneComponents(
+            components=PlanningSceneComponents.WORLD_OBJECT_NAMES)), 'get planning scene').scene.world.collision_objects
+        old = [o.id for o in objects if o.id.startswith(BIN_PREFIX)]
+        if old:
+            self.remove_objects(*old)               # of a run before: the bins may have moved since
+        table = TableMap(TABLE_TOP_Z, SURVEY_X, SURVEY_Y, [ROBOT_KEEP_OUT])
+        for x, y, yaw in SURVEY_VIEWS:
+            self.move_to(make_pose(x, y, SCAN_XYZ[2], top_down(yaw)), 'look for the bins', FREE_SPEED)
+            self.add_view(table)
+        found = table.bins()
+        left = sorted((b for b in found if b.center[1] > 0), key=lambda b: math.hypot(*b.center))
+        right = sorted((b for b in found if b.center[1] <= 0), key=lambda b: math.hypot(*b.center))
+        self.bins = left + right
+        if len(self.bins) < 2:
+            raise RuntimeError('{} bins found, at least two are needed: one for the parts, one for the rejects'.format(len(self.bins)))
+        self.tall_in_bin = [0] * len(self.bins)
+        for i, b in enumerate(self.bins):
+            self.get_logger().info('bin {}: {:.0f} x {:.0f} mm inside, rim {:.0f} mm, at ({:.3f}, {:.3f}), turned {:.0f} deg'.format(
+                i, b.length * 1000, b.width * 1000, b.rim * 1000, b.center[0], b.center[1], math.degrees(b.angle) % 180))
 
     def find_pieces(self, table):
         """The pieces in the map, taking apart the ones that touch as far as their heights allow."""
@@ -865,7 +913,7 @@ class PickAndPlace(Node):
                 self.get_logger().warn('{}, {}: no way to hold it, left on the table'.format(name, what))
                 continue
             self.get_logger().info('{}, {}: {}, grasp ({:.3f}, {:.3f}, {:.3f}) yaw {:.0f} deg, {:.0f} mm wide'.format(
-                name, what, 'bin {}'.format(self.piece_bins[number]) if number else 'reject bin {}'.format(REJECT_BIN),
+                name, what, 'bin {}'.format(self.piece_bins[number]) if number else 'reject bin {}'.format(self.reject_bin),
                 grasp.x, grasp.y, grasp.z, math.degrees(grasp.yaw), grasp.width * 1000))
             plans.append((piece, number, grasp))
         return plans, len(pieces)
@@ -878,8 +926,10 @@ class PickAndPlace(Node):
             if time.monotonic() > end:
                 raise RuntimeError('no joint states or no robot_description published')
             time.sleep(0.05)
+        self.find_bins()
+        self.assign_bins()
         self.clear_pieces()
-        self.add_objects(self.table_object(), *[self.bin_object(i) for i in range(len(BINS_XY))])
+        self.add_objects(self.table_object(), *[self.bin_object(i) for i in range(len(self.bins))])
 
     def sort_pieces(self, dry_run=False):
         """Clear the table: returns how many pieces went into their bins, into the reject bin, and how many are left."""
@@ -905,16 +955,16 @@ class PickAndPlace(Node):
             plans.sort(key=lambda plan: -plan[0].height)   # the tall ones topple if something touches them
             for i, (piece, number, grasp) in enumerate(plans):
                 tallest_left = plans[i + 1][0].height if i + 1 < len(plans) else 0.0
-                bin_index = self.piece_bins[number] if number else REJECT_BIN
+                bin_index = self.piece_bins[number] if number else self.reject_bin
                 name = number or 'unknown piece'
                 dropped = False
                 for _ in range(GRASP_ATTEMPTS):
                     tried.append(grasp)
                     try:
                         self.pick_and_drop(piece, grasp, bin_index, tallest_left, [p for p, _, _ in plans[i + 1:]])
-                        if piece.height > BIN_HEIGHT:
+                        if piece.height > self.bins[bin_index].rim:
                             self.tall_in_bin[bin_index] += 1
-                            self.bin_top = max(self.bin_top, BIN_WALL + piece.height)
+                            self.bin_top = max(self.bin_top, self.bins[bin_index].wall + piece.height)
                         if number:
                             placed += 1
                             self.get_logger().info('{} placed, {:.1f} s since the start'.format(number, time.monotonic() - start))

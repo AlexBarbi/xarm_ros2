@@ -50,12 +50,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from piece_vision import mold_bins, mold_parts  # noqa: E402
+from piece_vision import mold_parts  # noqa: E402
 SCENARIOS = ('scene', 'table', 'tipped', 'touching', 'belt')
-RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'status', 'exit', 'pieces', 'ok', 'wrong_bin', 'on_table',
+RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'bins_true', 'bins_found', 'bin_error_mm', 'status', 'exit', 'pieces', 'ok', 'wrong_bin', 'on_table',
               'lost', 'robot_s', 'wall_s', 'real_time_factor', 'in_window', 'drops', 'silent_failure', 'false_alarm',
               'straight_lines', 'around', 'moveit_errors']
-PIECE_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'piece', 'code', 'target_bin', 'outcome', 'where', 'said',
+PIECE_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'piece', 'code', 'target_bin', 'outcome', 'where', 'rejected', 'said',
                 'recognition', 'seen_mm', 'grasp_found', 'x', 'y', 'over_rim_mm']
 EVENT_FIELDS = ['run', 'scenario', 'noise', 'code', 'kind', 'count']
 MAX_JOINT4 = 3.2                # rad: past its stop it has torn loose, even if the fingers are still somewhere near
@@ -68,6 +68,9 @@ LOG_LINE = re.compile(r'^\[\w+\] \[[\d.]+\] \[pick_and_place\]: (.*)$')
 SEEN = re.compile(r'^(?:(\d{12})|unknown piece), (\d+) x (\d+) x (\d+) mm at \((-?[\d.]+), (-?[\d.]+)\)(.*)$')
 CODE_EVENT = re.compile(r'^(\d{12}): (.*)$')
 PLACED = re.compile(r'^(\d{12}) placed,')
+BIN_LINE = re.compile(r'^bin (\d+): (\d+) x (\d+) mm inside, rim (\d+) mm, at \((-?[\d.]+), (-?[\d.]+)\)')
+MOLD_LINE = re.compile(r'^mold \d+: (.*), unknown pieces into bin (\d+)$')
+BIN_MATCH = 0.05                # m between a bin the sorter found and a true one, to be the same
 DONE = re.compile(r'^done: (\d+) dropped into the bins, (?:\d+ into the reject bin, )?(\d+) on the table, (\d+) lost, ([\d.]+) s')
 EVENT_KINDS = (('slipped out', 'slip'), ('may have fallen', 'closed_in_transport'), ('lost during', 'lost_in_transport'),
                ('nothing between', 'empty_grasp'),
@@ -96,11 +99,11 @@ def read_worst(path):
 
 
 def sorter_constants(path):
-    """The bins, the table and the work area of pick_and_place.py, without importing it: it needs ROS."""
+    """The table and the work area of pick_and_place.py, without importing it: it needs ROS."""
     found = {}
     for node in ast.parse(Path(path).read_text()).body:
         if isinstance(node, ast.Assign) and getattr(node.targets[0], 'id', '') in (
-                'BINS_XY', 'BIN_INNER', 'BIN_HEIGHT', 'TABLE_TOP_Z', 'REJECT_BIN', 'WORK_X', 'WORK_Y'):
+                'TABLE_TOP_Z', 'WORK_X', 'WORK_Y'):
             found[node.targets[0].id] = ast.literal_eval(node.value)
     return found
 
@@ -111,12 +114,22 @@ def parse_log(text):
     counts = collections.Counter()
     drops = collections.Counter()
     done = None
+    bins, assigned, reject = {}, {}, None
     first_look = True
     for line in text.splitlines():
         match = LOG_LINE.match(line)
         if not match:
             continue
         message = match.group(1)
+        found = BIN_LINE.match(message)
+        if found:
+            bins[int(found.group(1))] = (float(found.group(5)), float(found.group(6)), int(found.group(2)), int(found.group(3)))
+            continue
+        mold = MOLD_LINE.match(message)
+        if mold:
+            assigned = {n: int(b) for n, b in re.findall(r'(\d{12}) into bin (\d+)', mold.group(1))}
+            reject = int(mold.group(2))
+            continue
         if message.startswith('above piece'):
             first_look = False
         if ': straight line to' in message:
@@ -143,20 +156,22 @@ def parse_log(text):
         if coded:
             kind = next((k for text_, k in EVENT_KINDS if text_ in coded.group(2)), 'other')
             events[(coded.group(1), kind)] += 1
-    return {'seen': seen, 'events': events, 'counts': counts, 'drops': drops, 'done': done}
+    return {'seen': seen, 'events': events, 'counts': counts, 'drops': drops, 'done': done, 'bins': bins,
+            'assigned': assigned, 'reject': reject}
 
 
-def where_is(piece, bins, inner):
+def where_is(piece, bins):
     """(where it is, how far over the walls it sticks out above the rim [mm]). It is in a bin if the walls hold it."""
     low, high = piece['low'], piece['high']
     if high[2] < -0.2:
         return 'floor', 0.0
     mean = piece['mean']
     below_low, below_high = piece['below_low'], piece['below_high']
-    mx, my = inner[0] / 2 + BIN_MARGIN, inner[1] / 2 + BIN_MARGIN
-    for i, (x, y) in enumerate(bins):
+    for i, found in enumerate(bins):
         if below_low is None or low[2] < -0.003:
             break
+        (x, y), inner = found['center'], found['inner']
+        mx, my = inner[0] / 2 + BIN_MARGIN, inner[1] / 2 + BIN_MARGIN
         inside = (below_low[0] > x - mx and below_high[0] < x + mx and below_low[1] > y - my and below_high[1] < y + my and
                   abs(mean[0] - x) < mx and abs(mean[1] - y) < my)
         if inside:
@@ -167,10 +182,29 @@ def where_is(piece, bins, inner):
     return 'elsewhere', 0.0
 
 
-def judge(start, end, log, bins, inner, piece_bins):
+def true_bin_of(log, bins):
+    """Bin number of the sorter -> number of the true bin it found, or -1 if it is none of them."""
+    match = {}
+    for index, (x, y, _, _) in log['bins'].items():
+        distances = [math.dist((x, y), b['center']) for b in bins]
+        match[index] = distances.index(min(distances)) if distances and min(distances) < BIN_MATCH else -1
+    return match
+
+
+def bin_check(log, bins):
+    """(how many true bins the sorter found, worst error of their centers [mm])"""
+    errors = [min((math.dist((x, y), b['center']) for x, y, _, _ in log['bins'].values()), default=1.0) for b in bins]
+    hits = [e for e in errors if e < BIN_MATCH]
+    return len(hits), round(max(hits) * 1000, 1) if hits else ''
+
+
+def judge(start, end, log, bins):
     """One row for each piece: where it ended up against where it should, and whether it was recognized."""
     rows = []
     truth = []
+    true_bin = true_bin_of(log, bins)
+    piece_bins = {code: true_bin[b] for code, b in log['assigned'].items()}
+    reject = true_bin.get(log['reject'], -2)
     for name, piece in start['pieces'].items():
         center = ((piece['low'][0] + piece['high'][0]) / 2, (piece['low'][1] + piece['high'][1]) / 2)
         truth.append({'name': name, 'code': piece['number'], 'center': center, 'seen': None})
@@ -181,7 +215,7 @@ def judge(start, end, log, bins, inner, piece_bins):
     for t in truth:
         piece = end['pieces'].get(t['name'])
         target = piece_bins.get(t['code'], -1)
-        where, over = where_is(piece, bins, inner) if piece else ('gone', 0.0)
+        where, over = where_is(piece, bins) if piece else ('gone', 0.0)
         if where == 'bin {}'.format(target):
             outcome = 'ok'
         elif where.startswith('bin'):
@@ -198,6 +232,7 @@ def judge(start, end, log, bins, inner, piece_bins):
         else:
             recognition = 'right' if seen['said'] == t['code'] else 'wrong'
         rows.append({'piece': t['name'], 'code': t['code'], 'target_bin': target, 'outcome': outcome, 'where': where,
+                     'rejected': int(where == 'bin {}'.format(reject)),
                      'said': (seen['said'] or '') if seen else '', 'recognition': recognition,
                      'seen_mm': 'x'.join(str(v) for v in seen['size']) if seen else '',
                      'grasp_found': int(bool(seen and seen['grasp'])), 'x': round(t['center'][0], 3),
@@ -254,12 +289,15 @@ def write_report(folder, command=''):
     clean = sum(r['ok'] == r['pieces'] and r['pieces'] != '0' for r in judged)
     robot = sum(float(r['robot_s']) for r in judged if r['robot_s'])
     wall = sum(float(r['wall_s']) for r in judged if r['wall_s'])
-    reject = sorter_constants(HERE.parent / 'pick_and_place.py')['REJECT_BIN']
-    rejected = sum(p['where'] == 'bin {}'.format(reject) for p in pieces)
+    rejected = sum(p.get('rejected') == '1' for p in pieces)
+    with_bins = [r for r in judged if r.get('bins_true')]
+    all_bins = sum(r['bins_found'] == r['bins_true'] for r in with_bins)
+    worst = max((float(r['bin_error_mm']) for r in with_bins if r['bin_error_mm']), default=0.0)
     out += ['## In sintesi', '',
             '- **Pezzi nel contenitore giusto: {}**, {} su {}.'.format(rate(ok, len(pieces)), ok, len(pieces)),
-            '- Nel bin degli scarti ({}): {}. Il batch usa solo codici noti, quindi ognuno è un pezzo non riconosciuto, '
-            'contato tra i bin sbagliati.'.format(reject, rejected),
+            '- Nel contenitore degli scarti: {}. Il batch usa solo codici noti, quindi ognuno è un pezzo non riconosciuto, '
+            'contato tra i bin sbagliati.'.format(rejected),
+            '- Casse trovate tutte in {} corse su {}; errore massimo del centro {:.0f} mm.'.format(all_bins, len(with_bins), worst),
             '- Corse perfette: {}, {} su {}.'.format(rate(clean, len(judged)), clean, len(judged)),
             '- Tempo robot per pezzo: {:.1f} s simulati. Corse: {:.1f} ore reali in tutto.'.format(
                 robot / len(pieces) if pieces else 0.0, wall / 3600),
@@ -457,13 +495,15 @@ class Batch:
         (self.folder / 'logs').mkdir(parents=True, exist_ok=True)
         self.python = HERE.parent
         sorter = sorter_constants(self.python / 'pick_and_place.py')
-        self.bins, self.inner, self.reject = sorter['BINS_XY'], sorter['BIN_INNER'], sorter['REJECT_BIN']
         self.models = Path(args.workspace) / 'shared' / 'piece_models.json'
         parts = mold_parts(self.models)
         self.molds = args.molds.split(',') if args.molds else sorted(parts)
-        self.mold_bins = {m: mold_bins(self.models, m, len(self.bins), self.reject) for m in self.molds}
-        codes = sorted(set(c for m in self.molds for c in self.mold_bins[m]))
-        self.isaac = Isaac(args, codes, {'rim_z': sorter['TABLE_TOP_Z'] + sorter['BIN_HEIGHT'], 'work_x': sorter['WORK_X']})
+        unknown = [m for m in self.molds if m not in parts]
+        if unknown:
+            raise SystemExit('stampi sconosciuti: {}, quelli in {}: {}'.format(unknown, self.models, ', '.join(sorted(parts))))
+        self.mold_parts = {m: parts[m] for m in self.molds}
+        codes = sorted(set(c for m in self.molds for c in self.mold_parts[m]))
+        self.isaac = Isaac(args, codes, {'work_x': sorter['WORK_X']})
         self.environment = dict(os.environ, ROS_DOMAIN_ID=str(args.domain), BATCH_WORKSPACE=args.workspace,
                                 MOLD_FILE=str(self.isaac.state / 'mold.txt'))     # the mold of the run, not the one in production
         self.source = 'source {} && source {}/install/setup.bash && '.format(args.ros_setup, args.workspace)
@@ -530,7 +570,7 @@ class Batch:
         wait = self.args.belt_timeout if belt else 120.0
         (self.isaac.state / 'mold.txt').write_text(spec['mold'] + '\n')     # the belt and the sorter read it
         start = self.isaac.command(wait, cmd='reset', scenario=spec['scenario'], seed=spec['seed'], count=self.args.pieces,
-                                   codes=sorted(self.mold_bins[spec['mold']]))['snapshot']
+                                   codes=self.mold_parts[spec['mold']])['snapshot']
         if not start['pieces']:
             raise SystemExit('nessun pezzo nello scenario {}: scene usa quelli salvati in world.usd'.format(spec['scenario']))
         moveit, extras, sorter = None, [], None
@@ -581,14 +621,16 @@ class Batch:
 
     def record(self, spec, status, code, start, before, end, wall, log_path):
         log = parse_log(log_path.read_text(errors='replace'))
-        rows = judge(start, end, log, self.bins, self.inner, self.mold_bins[spec['mold']])
+        rows = judge(start, end, log, start['bins'])
+        bins_found, bin_error = bin_check(log, start['bins'])
         tally = collections.Counter(r['outcome'] for r in rows)
         robot = end['t'] - before['t']
         window = ''
         if spec['scenario'] == 'belt':
             window = int(robot <= self.args.belt_window and tally['ok'] == len(rows))
         all_ok = tally['ok'] == len(rows) and bool(rows)
-        result = dict(spec, status=status, exit='' if code is None else code, pieces=len(rows), ok=tally['ok'],
+        result = dict(spec, bins_true=len(start['bins']), bins_found=bins_found, bin_error_mm=bin_error,
+                      status=status, exit='' if code is None else code, pieces=len(rows), ok=tally['ok'],
                       wrong_bin=tally['wrong_bin'], on_table=tally['on_table'], lost=tally['lost'],
                       robot_s=round(robot, 1), wall_s=round(wall, 1), real_time_factor=round(robot / max(wall, 1e-3), 2),
                       in_window=window, drops=sum(log['drops'].values()),
@@ -613,7 +655,7 @@ class Batch:
         begun = time.monotonic()
         finished = 0
         print('Risultati in {}\nStampi: {}'.format(self.folder, ', '.join(
-            '{} ({})'.format(m, ', '.join(c[-5:] for c in self.mold_bins[m])) for m in self.molds)), flush=True)
+            '{} ({})'.format(m, ', '.join(c[-5:] for c in self.mold_parts[m])) for m in self.molds)), flush=True)
         for spec in self.specs():
             if spec['run'] in self.done:
                 finished += 1

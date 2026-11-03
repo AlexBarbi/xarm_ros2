@@ -2,25 +2,31 @@
 
 `pick_and_place.py` svuota il tavolo di `shared/world.usd`: trova i pezzi con la camera di profondità sul polso, riconosce il codice (part number) di ognuno confrontandolo con il CAD, sceglie dove prenderlo e lo lascia cadere nel suo contenitore. Ripete finché sul tavolo non resta niente.
 
-Della posizione dei pezzi non c'è niente scritto nel codice. Sono fissi solo il tavolo, il nastro e i 4 contenitori, presi da `world.usd`.
+Della posizione dei pezzi e delle casse non c'è niente scritto nel codice. Sono fissi solo il tavolo e il nastro, presi da `world.usd`.
+
+**Le casse si trovano all'avvio.** Il robot guarda dall'alto a sinistra e a destra del nastro e sopra di esso, e nella mappa delle altezze cerca le zone chiuse tutt'intorno da pareti più alte di 5 cm. I pezzi sono pieni e le sponde del nastro sono aperte alle estremità, quindi non chiudono niente.
+- Per ogni cassa ricava centro, misure interne, orientamento, altezza del bordo e spessore delle pareti, e le scrive nel log: `bin 0: 180 x 170 mm inside, rim 122 mm, at (-0.140, 0.270), turned 0 deg`.
+- Le numera prima a sinistra (y > 0) dalla più vicina al robot, poi a destra allo stesso modo.
+- Le mette nella scena di MoveIt con le misure trovate. Altezze di trasporto e di rilascio vengono dal bordo di ciascuna.
+- Si possono spostare, aggiungere o togliere tra un avvio e l'altro, purché restino dove il braccio arriva. Con `--dry-run` si vede cosa trova senza muovere pezzi.
 
 **Lo stampo.** Arrivano solo i pezzi di uno stampo alla volta, quello scritto in `shared/mold.txt`. Lo leggono sia il nastro, che fa cadere solo i suoi pezzi, sia il robot, che cerca solo quei codici: meno codici, meno scambi.
 
-| Stampo | Contenitore 0 | Contenitore 1 | Contenitore 2 |
+| Stampo | Cassa 0 | Cassa 1 | Cassa 2 |
 |---|---|---|---|
 | 940016506 | 47527 | 47531 | 56753 |
 | 940016509 | 47465 | 47481 | 53152 |
 | 940017355 | 49205 | 51189 | 52737 |
 | 940017433 | 57387 | 57388 | – |
 
-- I codici di uno stampo vanno nei contenitori 0, 1, 2 nell'ordine dei numeri. La tabella la ricava il programma dai CAD (`piece_models.json`, cartella "Stampo N"), quindi un nuovo stampo con i suoi CAD funziona senza cambiare il codice.
-- Il **contenitore 3 è degli scarti**: ci vanno i pezzi non riconosciuti che si possono prendere. Quelli senza una presa possibile restano sul nastro, e il giro dopo il nastro li porta oltre la fine.
+- I codici di uno stampo vanno nelle prime casse, nell'ordine dei numeri. La tabella la ricava il programma dai CAD (`piece_models.json`, cartella "Stampo N"), quindi un nuovo stampo con i suoi CAD funziona senza cambiare il codice.
+- **L'ultima cassa è degli scarti**, con 6 casse la 5 (la più lontana a destra): ci vanno i pezzi non riconosciuti che si possono prendere. Quelli senza una presa possibile restano sul nastro, e il giro dopo il nastro li porta oltre la fine. Le casse in mezzo restano libere.
 - **Cambiare stampo:** `pick_and_place.py --mold 940017355`, oppure scrivere il numero in `shared/mold.txt`. Il nastro lo rilegge a ogni giro, il robot a ogni giro di `--conveyor`.
 
-**Disposizione** (vista dall'alto, il robot guarda verso −x):
+**Disposizione in `world.usd`** (vista dall'alto, il robot guarda verso −x):
 
 - il nastro è centrato davanti al robot, y da −0,10 a 0,10, e si ferma a x −0,16;
-- i contenitori, interni 22×17 cm e profondi 12 cm, sono due per lato: 0 a (−0,20; 0,27), 1 a (−0,45; 0,27), 2 a (−0,20; −0,27), 3 a (−0,45; −0,27).
+- 6 casse, interne 18×17 cm e profonde 12 cm, tre per lato a x −0,14 / −0,345 / −0,55 e y ±0,27.
 
 | File | Cosa contiene |
 |---|---|
@@ -184,7 +190,7 @@ Per questo una perdita si decide solo **sopra il tavolo**:
 
 ## Scena di MoveIt
 
-- **Fissi:** il tavolo (una scatola con la superficie 5 mm sotto il piano, così non tocca la base del robot né i pezzi) e i 4 contenitori (fondo e quattro pareti).
+- **Fissi:** il tavolo (una scatola con la superficie 5 mm sotto il piano, così non tocca la base del robot né i pezzi) e le casse trovate all'avvio (fondo e quattro pareti, con le loro misure).
 - **A ogni giro:** i pezzi trovati come scatole con 1 cm di margine. Quella del pezzo da prendere viene tolta prima di scendere, attaccata alla pinza durante il trasporto e rimossa al rilascio. Durante discesa e salita si tolgono anche le scatole dei pezzi entro 3 cm: lo spazio per le dita lo garantisce già la mappa delle altezze, mentre con il margine il pezzo in mano risultava già in collisione con il vicino e MoveIt rifiutava la salita (errore -10). Tornano nella scena appena finita la salita.
 - **All'avvio:** si tolgono i pezzi rimasti da un'esecuzione interrotta.
 
@@ -192,7 +198,8 @@ Per questo una perdita si decide solo **sopra il tavolo**:
 
 | Parametro | Valore | Cosa regola |
 |---|---|---|
-| `MOLD_FILE`, `REJECT_BIN` | `shared/mold.txt`, 3 | Stampo in produzione, contenitore degli scarti |
+| `MOLD_FILE` | `shared/mold.txt` | Stampo in produzione |
+| `SURVEY_X`, `SURVEY_Y`, `SURVEY_VIEWS` | 0,86 × 1,2 m, 4 viste, 2 per lato | Dove cercare le casse all'avvio |
 | `SCAN_XYZ`, `SCAN_YAW`, `MORE_VIEWS` | 1 + 2 viste a 0,397 m, pinza girata di −90° | La camera, 68 mm fuori dall'asse del TCP, sta sopra il centro della zona di presa con il lato lungo dell'immagine lungo il nastro |
 | `FREE_SPEED`, `CARRY_SPEED`, `LINEAR_SPEED` | 1.0, 1.0, 1.0 | Frazione dei limiti di velocità dei giunti; `ACCELERATION` 0.8 |
 | `LINE_STEP` | 5 mm | Passo dei punti della linea retta |
@@ -235,6 +242,6 @@ Prima del 3 novembre, con 3 codici e senza rumore: 10/10 sulla tua disposizione 
 - **47531 in piedi su uno spigolo** non ha una posa stabile nel CAD e viene preso per un 51189 in piedi (43×14×64 contro 42×20×68 mm).
 - **Pinza simulata.** Su prese strette il meccanismo a catena chiusa a volte si strappa e lancia il pezzo: 5 volte in una giornata con il motore a 5 N·m (45 N). Ora `world.usd` ha 2,2 N·m, cioè 20 N sul pezzo (un motore per due dita, leva 0,055 m): nessuna esplosione in 8 corse sulle stesse disposizioni, troppo poche per dirlo risolto. Per un'altra forza: `batch_test.py --grip-torque` per provarla, `shared/set_grip_torque.py` per salvarla in `world.usd`.
 - **Stampo 940016506.** 47527 e 56753 sono quasi gemelli e si possono confondere: sono nello stesso stampo, quindi lo scambio resta.
-- **Posizioni fisse.** Tavolo e contenitori sono costanti prese da `world.usd`: se si spostano nella scena, vanno aggiornate nel codice.
+- **Posizioni fisse.** Tavolo e nastro sono costanti prese da `world.usd`: se si spostano nella scena, vanno aggiornate nel codice. Le casse no.
 - **Percorso del CAD.** `MODELS` è relativo alla cartella da cui si lancia lo script (va lanciato da `ros_ws`).
 - **Sessione interattiva.** Lo script non è mai stato eseguito nella sessione di Isaac con interfaccia in streaming, che lì girava a circa 0,2 volte il tempo reale.

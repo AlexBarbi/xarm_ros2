@@ -25,6 +25,11 @@ MIN_PIECE_HEIGHT = 0.008        # lower than this is the table: noise of a real 
 MEDIAN_CELLS = 3                # the depth noise goes with a median this wide: wider, it eats the thin ribs of the pieces
 TOP_PERCENTILE = 99.8           # of the height of a piece: the very highest cell is noise
 MAX_PIECE_HEIGHT = 0.14         # higher than this is the gripper in the view
+BIN_MIN_WALL = 0.05             # m: walls taller than this that close an area all around are a bin
+BIN_MIN_INNER = 0.08            # m of the shorter inner side of a bin: smaller closed areas are something else
+BIN_FILL = 0.85                 # inner area of a bin against its smallest rectangle: less is not a rectangular box
+BIN_GAP_CELLS = 3               # gaps in the top of a wall this wide (noise, missing pixels) still close it
+BIN_MAX_WALL = 0.015            # m: thicker walls are taken as this, for the planner
 MIN_PIECE_CELLS = 150
 PIECE_MERGE_CELLS = 3           # parts of the height map closer than twice this are the same piece
 MAX_HIDDEN_CELLS = 3000         # unseen areas smaller than this are shadows of what stands next to them
@@ -136,15 +141,16 @@ def mold_parts(models_path):
     return {mold: sorted(numbers) for mold, numbers in molds.items()}
 
 
-def mold_bins(models_path, mold, bin_count, reject_bin):
-    """Part number -> bin for a mold: its parts in the order of their numbers, into the bins other than reject_bin."""
+def mold_bins(models_path, mold, bin_count):
+    """Part number -> bin for a mold: its parts in the order of their numbers into the first bins, the last bin is left
+    for the pieces nobody knows."""
     parts = mold_parts(models_path)
     if mold not in parts:
         raise ValueError('mold {} unknown, the ones in {}: {}'.format(mold, models_path, ', '.join(sorted(parts))))
-    bins = [i for i in range(bin_count) if i != reject_bin]
-    if len(parts[mold]) > len(bins):
-        raise ValueError('mold {} has {} parts and there are {} bins for them'.format(mold, len(parts[mold]), len(bins)))
-    return dict(zip(parts[mold], bins))
+    if len(parts[mold]) > bin_count - 1:
+        raise ValueError('mold {} has {} parts, and {} bins are one for each and one for the rejects'.format(
+            mold, len(parts[mold]), bin_count))
+    return {number: i for i, number in enumerate(parts[mold])}
 
 
 class PieceLibrary:
@@ -198,6 +204,16 @@ class Piece:
 
 
 @dataclass
+class Bin:
+    center: tuple               # (x, y) of the inside
+    length: float               # inside, along angle
+    width: float
+    angle: float                # of the length axis
+    rim: float                  # top of the walls above the table
+    wall: float                 # thickness of the walls
+
+
+@dataclass
 class Grasp:
     x: float
     y: float
@@ -248,6 +264,38 @@ class TableMap:
         self.views[known] += ndimage.median_filter(view, size=MEDIAN_CELLS)[known]
         self.view_count[known] += 1
         self.seen |= seen
+
+    def bins(self):
+        """The open boxes in the map: areas closed all around by walls. Pieces are solid and the sides of the belt are
+        open at its ends, so neither closes anything."""
+        height = np.divide(self.views, self.view_count, out=np.zeros(self.shape), where=self.view_count > 0)
+        xs = self.x0 + (np.arange(self.shape[0]) + 0.5) * CELL
+        ys = self.y0 + (np.arange(self.shape[1]) + 0.5) * CELL
+        gx, gy = np.meshgrid(xs, ys, indexing='ij')
+        for x, y, radius in self.keep_out:
+            height[np.hypot(gx - x, gy - y) < radius] = 0.0
+        walls = ndimage.binary_closing(height > BIN_MIN_WALL, iterations=BIN_GAP_CELLS)
+        filled = ndimage.binary_fill_holes(walls)
+        inside, count = ndimage.label(filled & ~walls)
+        found = []
+        for label in range(1, count + 1):
+            mask = inside == label
+            cells = np.argwhere(mask)
+            if len(cells) * CELL ** 2 < BIN_MIN_INNER ** 2:
+                continue
+            xy = (cells + 0.5) * CELL + (self.x0, self.y0)
+            length, width, angle = min_area_rectangle(xy)
+            if width < BIN_MIN_INNER or len(cells) * CELL ** 2 < BIN_FILL * length * width:
+                continue
+            c, s = math.cos(angle), math.sin(angle)
+            u, v = xy[:, 0] * c + xy[:, 1] * s, -xy[:, 0] * s + xy[:, 1] * c
+            mid_u, mid_v = (u.min() + u.max()) / 2, (v.min() + v.max()) / 2
+            # its own walls, not those of a bin next to it: the wall cells all around, as thick as the walls go
+            ring = ndimage.binary_dilation(mask, iterations=int(BIN_MAX_WALL / CELL)) & walls & ~mask
+            wall = min(ring.sum() * CELL ** 2 / (2 * (length + width)), BIN_MAX_WALL)
+            found.append(Bin((mid_u * c - mid_v * s, mid_u * s + mid_v * c), length, width, angle,
+                             float(np.percentile(height[ring], 90)) if ring.any() else BIN_MIN_WALL, wall))
+        return found
 
     def segment(self):
         """Split the height map into pieces."""
