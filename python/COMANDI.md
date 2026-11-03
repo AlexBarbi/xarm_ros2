@@ -82,7 +82,20 @@ python3 src/xarm_ros2/python/pick_and_place.py --conveyor --mold 940017355
 echo 940017355 > shared/mold.txt                                   # oppure così
 ```
 
-Stampi: 940016506, 940016509, 940017355, 940017433. I loro codici vanno nelle prime casse (prima quelle a sinistra, dalla più vicina al robot); l'ultima è degli scarti.
+Stampi: 940016506, 940016509, 940017355, 940017433. Di partenza i loro codici vanno nelle prime casse (prima quelle alla destra del robot, dalla più vicina) e l'ultima è degli scarti; dalla pagina web si cambia tutto.
+
+**Pagina web.** Lo smistatore serve una pagina sulla porta 8080 (`--web-port`, 0 per toglierla). Dal PC del robot apri `http://localhost:8080`. Da un altro PC, se raggiungi il robot solo via SSH:
+
+```bash
+ssh -L 8080:localhost:8080 utente@pc-del-robot      # poi nel browser: http://localhost:8080
+```
+
+La pagina si aggiorna da sola e mostra:
+- la vista dall'alto, con nastro, casse e il pezzo che il robot sta prendendo, con la cassa dove va;
+- una scheda per cassa, dove scegli cosa ci va (un codice dello stampo, "scarti" o "libera") e il massimo di pezzi, e vedi quanti pezzi contiene e di che codice;
+- lo stampo, che si cambia dalla tendina in alto.
+
+Quando tutte le casse di un codice sono piene il robot si ferma; dopo averne cambiata una, premi **Cassa cambiata**. In Isaac quel pulsante svuota anche la cassa. Quando la cassa degli scarti arriva al massimo (10 di partenza), il robot la prende per la parete verso il nastro, la rovescia sul nastro, la rimette a posto e riprova a riconoscere i pezzi. Conteggi, massimi e assegnazioni restano salvati in `shared/bins_state.json` anche dopo un riavvio.
 
 Con il rumore della camera, in un quarto terminale:
 
@@ -125,6 +138,7 @@ Per fermarlo: `kill <pid>` oppure Ctrl-C se è in primo piano. I risultati racco
 | Rumore della camera | `--noise 1` (default `0,1`: metà corse senza, metà con) |
 | L'azione della pinza reale (sostituto) invece del controller | `--gripper driver` oppure `both` |
 | Un'altra forza della pinza | `--grip-torque 3.3` (N·m = N sul pezzo × 0,11; `world.usd` ha 2,2, cioè 20 N) |
+| Prova della cassa degli scarti piena | `--scenarios rejects` (5 pezzi buoni nella cassa degli scarti, che il robot trova piena: deve rovesciarla e smistarli) |
 | Riprendere una sessione interrotta | `--out batch_results/<cartella>` (la stessa) |
 | Solo alcuni stampi | `--molds 940016509,940017433` (default: tutti, una corsa ciascuno a turno) |
 | Rifare corse precise | `--replay table:7590197:940016509 belt:48460314:940017433` (scenario:seed:stampo, colonna "Per rifarla" del report) |

@@ -13,3 +13,7 @@ shared/*.before_*
 shared/.conveyor_*
 shared/.batch_*
 shared/*.pt
+shared/bins_state.json
+shared/bins_state.tmp
+shared/.bins_changed
+shared/*.tmp

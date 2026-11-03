@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selezionatore</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6a7282; --line: #d9dde4;
+  --belt: #e3e7ee; --bin: #ffffff; --bin-line: #8a93a3; --accent: #2563eb; --ok: #16a34a;
+  --warn: #d97706; --bad: #dc2626; --reject: #7c3aed; --piece: #f59e0b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --panel: #1b2029; --text: #e6e9ef; --muted: #98a1b2; --line: #2d3442;
+    --belt: #262d39; --bin: #1b2029; --bin-line: #7d8799; --accent: #60a5fa; --ok: #4ade80;
+    --warn: #fbbf24; --bad: #f87171; --reject: #a78bfa; --piece: #fbbf24;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 system-ui, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; padding: 14px 16px;
+         background: var(--panel); border-bottom: 1px solid var(--line); }
+h1 { font-size: 18px; margin: 0; }
+label { color: var(--muted); font-size: 13px; }
+select, input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+                border-radius: 6px; padding: 4px 6px; }
+#status { flex: 1 1 280px; padding: 6px 10px; border-radius: 6px; background: var(--bg); }
+#status.waiting { background: color-mix(in srgb, var(--warn) 22%, transparent); font-weight: 600; }
+#link { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
+#link.on { background: var(--ok); }
+main { display: grid; grid-template-columns: minmax(280px, 520px) 1fr; gap: 16px; padding: 16px; }
+@media (max-width: 820px) { main { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+svg { width: 100%; height: auto; display: block; }
+.belt { fill: var(--belt); }
+.belt-label { fill: var(--muted); font-size: 26px; }
+.bin rect { fill: var(--bin); stroke: var(--bin-line); stroke-width: 6; }
+.bin.full rect { stroke: var(--warn); stroke-width: 10; }
+.bin.rejects rect { stroke-dasharray: 18 10; }
+.bin .fill { stroke: none; fill: color-mix(in srgb, var(--accent) 30%, transparent); }
+.bin.rejects .fill { fill: color-mix(in srgb, var(--reject) 30%, transparent); }
+.bin text { fill: var(--text); font-size: 30px; text-anchor: middle; }
+.bin .small { fill: var(--muted); font-size: 22px; }
+.robot { fill: var(--line); stroke: var(--bin-line); stroke-width: 4; }
+.route { stroke: var(--piece); stroke-width: 5; stroke-dasharray: 14 12; fill: none; }
+.piece { fill: var(--piece); stroke: var(--text); stroke-width: 3; transition: cx 1.5s ease-in-out, cy 1.5s ease-in-out, opacity .6s; }
+.piece.pick { animation: pulse 1s infinite; }
+@keyframes pulse { 50% { r: 26; } }
+.piece-label { fill: var(--text); font-size: 24px; font-weight: 600; }
+#cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; align-content: start; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.card.full { border-color: var(--warn); box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 40%, transparent); }
+.card h2 { font-size: 16px; margin: 0 0 8px; display: flex; justify-content: space-between; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0; }
+.row select { flex: 1; min-width: 0; }
+.row input { width: 70px; }
+.bar { height: 8px; border-radius: 4px; background: var(--bg); overflow: hidden; margin: 8px 0; }
+.bar div { height: 100%; background: var(--accent); }
+.card.rejects .bar div { background: var(--reject); }
+.card.full .bar div { background: var(--warn); }
+.contents { color: var(--muted); font-size: 13px; min-height: 18px; }
+button { font: inherit; width: 100%; margin-top: 8px; padding: 7px; border-radius: 6px; cursor: pointer;
+         border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+.card.full button { background: var(--warn); border-color: var(--warn); color: #000; font-weight: 600; }
+#error { color: var(--bad); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="link" title="collegamento al robot"></span>
+  <h1>Selezionatore</h1>
+  <div><label for="mold">Stampo</label> <select id="mold"></select></div>
+  <div id="status">in attesa del robot…</div>
+  <div id="error"></div>
+</header>
+<main>
+  <div class="panel"><svg id="view" viewBox="-620 -840 1240 980" role="img" aria-label="Vista dall'alto"></svg></div>
+  <div id="cards"></div>
+</main>
+<script>
+// world (m) to the view (mm): seen from above, the robot at the bottom, the belt going up; +y to the right
+const P = (x, y) => [y * 1000, x * 1000];
+const NS = 'http://www.w3.org/2000/svg';
+let state = null, layout = '';
+
+function el(name, attrs, parent) {
+  const e = document.createElementNS(NS, name);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+function post(what, bin, value) {
+  fetch('/set', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                 body: JSON.stringify({what, bin, value})})
+    .then(r => r.json()).then(r => { document.getElementById('error').textContent = r.error || ''; })
+    .catch(() => { document.getElementById('error').textContent = 'robot non raggiungibile'; });
+}
+
+function short(code) { return code === 'scarti' ? 'scarti' : code ? code.slice(-5) : 'libera'; }
+
+function counts(list) {
+  const c = {};
+  for (const x of list) c[x] = (c[x] || 0) + 1;
+  return Object.entries(c).map(([k, n]) => (k === 'unknown' ? 'sconosciuti' : k.slice(-5)) + ' ×' + n).join(', ');
+}
+
+function drawView(s) {
+  const svg = document.getElementById('view');
+  svg.replaceChildren();
+  const [x0, x1, y0, y1] = s.work_area;
+  const [bx, by] = P(x0, y0), [bx2, by2] = P(x1, y1);
+  el('rect', {class: 'belt', x: Math.min(bx, bx2), y: Math.min(by, by2), width: Math.abs(bx2 - bx), height: Math.abs(by2 - by), rx: 10}, svg);
+  el('text', {class: 'belt-label', x: 0, y: Math.min(by, by2) + 34, 'text-anchor': 'middle'}, svg).textContent = 'nastro';
+  el('circle', {class: 'robot', cx: 0, cy: 0, r: 80}, svg);
+  el('text', {class: 'belt-label', x: 0, y: 10, 'text-anchor': 'middle'}, svg).textContent = 'robot';
+  for (const b of s.bins) {
+    const [cx, cy] = P(b.center[0], b.center[1]);
+    const turn = Math.atan2(Math.cos(b.angle), Math.sin(b.angle)) * 180 / Math.PI;
+    const full = b.contents.length >= b.max;
+    const g = el('g', {class: 'bin' + (full ? ' full' : '') + (b.use === 'scarti' ? ' rejects' : ''),
+                       transform: `translate(${cx} ${cy})`}, svg);
+    const L = b.length * 1000, W = b.width * 1000;
+    const r = el('g', {transform: `rotate(${turn})`}, g);
+    el('rect', {x: -L / 2, y: -W / 2, width: L, height: W, rx: 6}, r);
+    const f = Math.min(b.contents.length / b.max, 1);
+    el('rect', {class: 'fill', x: -L / 2 + 4, y: W / 2 - 4 - (W - 8) * f, width: L - 8, height: (W - 8) * f}, r);
+    el('text', {y: -8}, g).textContent = b.index + ' · ' + short(b.use);
+    el('text', {class: 'small', y: 26}, g).textContent = b.contents.length + ' / ' + b.max;
+  }
+  const a = s.action;
+  if (a && a.from && a.to !== undefined && s.bins[a.to]) {
+    const [fx, fy] = P(a.from[0], a.from[1]);
+    const [tx, ty] = P(s.bins[a.to].center[0], s.bins[a.to].center[1]);
+    el('path', {class: 'route', d: `M${fx} ${fy} L${tx} ${ty}`}, svg);
+    const at = a.phase === 'pick' ? [fx, fy] : [tx, ty];
+    const dot = el('circle', {class: 'piece' + (a.phase === 'pick' ? ' pick' : ''), cx: fx, cy: fy, r: 20}, svg);
+    el('text', {class: 'piece-label', x: fx + 28, y: fy - 22}, svg).textContent = short(a.code || 'unknown');
+    if (a.phase !== 'pick') requestAnimationFrame(() => { dot.setAttribute('cx', at[0]); dot.setAttribute('cy', at[1]); });
+  }
+}
+
+function drawCards(s) {
+  const cards = document.getElementById('cards');
+  const shape = s.mold + '|' + s.bins.length;
+  if (shape !== layout) {
+    layout = shape;
+    cards.replaceChildren();
+    for (const b of s.bins) {
+      const c = document.createElement('div');
+      c.className = 'card';
+      c.innerHTML = `<h2><span>Cassa ${b.index}</span><span class="count"></span></h2>
+        <div class="row"><label>Cosa ci va</label><select class="use"></select></div>
+        <div class="row"><label>Massimo</label><input class="max" type="number" min="1"></div>
+        <div class="bar"><div></div></div>
+        <div class="contents"></div>
+        <button>Cassa cambiata</button>`;
+      const use = c.querySelector('.use');
+      for (const code of [...(s.molds[s.mold] || []), 'scarti', '']) {
+        const o = document.createElement('option');
+        o.value = code; o.textContent = code === 'scarti' ? 'scarti' : code || 'libera';
+        use.appendChild(o);
+      }
+      use.onchange = () => post('use', b.index, use.value);
+      const max = c.querySelector('.max');
+      max.onchange = () => post('max', b.index, parseInt(max.value, 10));
+      c.querySelector('button').onclick = () => post('changed', b.index);
+      cards.appendChild(c);
+    }
+  }
+  s.bins.forEach((b, i) => {
+    const c = cards.children[i];
+    const full = b.contents.length >= b.max;
+    c.className = 'card' + (full ? ' full' : '') + (b.use === 'scarti' ? ' rejects' : '');
+    c.querySelector('.count').textContent = b.contents.length + ' / ' + b.max;
+    const use = c.querySelector('.use'), max = c.querySelector('.max');
+    if (document.activeElement !== use) use.value = b.use;
+    if (document.activeElement !== max) max.value = b.max;
+    c.querySelector('.bar div').style.width = Math.min(100, 100 * b.contents.length / b.max) + '%';
+    c.querySelector('.contents').textContent = counts(b.contents) || 'vuota';
+  });
+}
+
+function render(s) {
+  state = s;
+  const mold = document.getElementById('mold');
+  if (mold.options.length !== Object.keys(s.molds).length) {
+    mold.replaceChildren();
+    for (const m of Object.keys(s.molds).sort()) {
+      const o = document.createElement('option');
+      o.value = m; o.textContent = m + ' (' + s.molds[m].map(c => c.slice(-5)).join(', ') + ')';
+      mold.appendChild(o);
+    }
+    mold.onchange = () => post('mold', null, mold.value);
+  }
+  if (document.activeElement !== mold) mold.value = s.mold;
+  const status = document.getElementById('status');
+  status.textContent = s.status;
+  status.className = s.waiting ? 'waiting' : '';
+  drawView(s);
+  drawCards(s);
+}
+
+function connect() {
+  const events = new EventSource('/events');
+  events.onopen = () => document.getElementById('link').className = 'on';
+  events.onmessage = e => render(JSON.parse(e.data));
+  events.onerror = () => document.getElementById('link').className = '';
+}
+connect();
+</script>
+</body>
+</html>

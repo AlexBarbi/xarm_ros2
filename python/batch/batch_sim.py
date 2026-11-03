@@ -147,6 +147,10 @@ def lay_out(stage, scenario, seed, count, codes):
     else:
         chosen = choose(rng, count, codes)
     x0, x1, y0, y1 = pick_zone(stage)
+    if scenario == 'rejects':               # in the bin of the rejects, the last one of the sorter (right, furthest out)
+        rejects = max((b for b in BINS if b['center'][1] <= 0), key=lambda b: math.hypot(*b['center']))
+        (cx, cy), (lx, ly) = rejects['center'], rejects['inner']
+        x0, x1, y0, y1 = cx - lx / 2 + EDGE, cx + lx / 2 - EDGE, cy - ly / 2 + EDGE, cy + ly / 2 - EDGE
     for i, name in enumerate(sorted(set(pieces) - set(chosen))):
         place(stage, pieces[name], Gf.Quatd(1, 0, 0, 0), PARK[0] + i * 0.3, PARK[1], PARK[2])
     if scenario == 'scene':
@@ -172,12 +176,12 @@ def lay_out(stage, scenario, seed, count, codes):
     for name in free:
         for _ in range(2000):
             x, y = rng.uniform(x0, x1), rng.uniform(y0, y1)
-            if all(math.hypot(x - u, y - v) > 0.11 for u, v in taken):
+            if scenario == 'rejects' or all(math.hypot(x - u, y - v) > 0.11 for u, v in taken):
                 break
         taken.append((x, y))
         yaw = rng.uniform(-math.pi, math.pi)
         orientation = Gf.Quatd(math.cos(yaw / 2), 0, 0, math.sin(yaw / 2))
-        z = 0.07
+        z = 0.07 if scenario != 'rejects' else RIM_Z + 0.04 + 0.03 * len(taken)   # dropped in, one over the other
         if scenario == 'tipped' and rng.random() < 0.7:
             roll = rng.choice([math.pi / 2, -math.pi / 2])
             orientation, z = orientation * Gf.Quatd(math.cos(roll / 2), math.sin(roll / 2), 0, 0), 0.09

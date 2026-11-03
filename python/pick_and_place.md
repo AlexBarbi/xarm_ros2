@@ -6,7 +6,7 @@ Della posizione dei pezzi e delle casse non c'è niente scritto nel codice. Sono
 
 **Le casse si trovano all'avvio.** Il robot guarda dall'alto a sinistra e a destra del nastro e sopra di esso, e nella mappa delle altezze cerca le zone chiuse tutt'intorno da pareti più alte di 5 cm. I pezzi sono pieni e le sponde del nastro sono aperte alle estremità, quindi non chiudono niente.
 - Per ogni cassa ricava centro, misure interne, orientamento, altezza del bordo e spessore delle pareti, e le scrive nel log: `bin 0: 180 x 170 mm inside, rim 122 mm, at (-0.140, 0.270), turned 0 deg`.
-- Le numera prima a sinistra (y > 0) dalla più vicina al robot, poi a destra allo stesso modo.
+- Le numera prima quelle con y > 0 (alla destra del robot, e a destra nella pagina web) dalla più vicina al robot, poi le altre allo stesso modo.
 - Le mette nella scena di MoveIt con le misure trovate. Altezze di trasporto e di rilascio vengono dal bordo di ciascuna.
 - Si possono spostare, aggiungere o togliere tra un avvio e l'altro, purché restino dove il braccio arriva. Con `--dry-run` si vede cosa trova senza muovere pezzi.
 
@@ -22,6 +22,14 @@ Della posizione dei pezzi e delle casse non c'è niente scritto nel codice. Sono
 - I codici di uno stampo vanno nelle prime casse, nell'ordine dei numeri. La tabella la ricava il programma dai CAD (`piece_models.json`, cartella "Stampo N"), quindi un nuovo stampo con i suoi CAD funziona senza cambiare il codice.
 - **L'ultima cassa è degli scarti**, con 6 casse la 5 (la più lontana a destra): ci vanno i pezzi non riconosciuti che si possono prendere. Quelli senza una presa possibile restano sul nastro, e il giro dopo il nastro li porta oltre la fine. Le casse in mezzo restano libere.
 - **Cambiare stampo:** `pick_and_place.py --mold 940017355`, oppure scrivere il numero in `shared/mold.txt`. Il nastro lo rilegge a ogni giro, il robot a ogni giro di `--conveyor`.
+
+**Casse piene e pagina web** (`sorter_web.py`, `sorter_web.html`):
+
+- Il robot conta i pezzi che mette in ogni cassa e di che codice sono, e lo salva in `shared/bins_state.json`, ritrovando le casse per posizione dopo un riavvio.
+- Dalla pagina si sceglie per ogni cassa cosa ci va (un codice dello stampo, scarti o niente) e il massimo. Più casse possono avere lo stesso codice: il robot riempie la prima e passa alla successiva.
+- Quando tutte le casse di un codice sono piene il robot si ferma e aspetta il pulsante **Cassa cambiata**. In Isaac quel pulsante svuota la cassa: lo fa lo script del nastro, leggendo `shared/.bins_changed`.
+- **Scarti pieni:** il robot prende la cassa per la parete più vicina al nastro, 3 cm sotto il bordo, la solleva di 17 cm, la porta sopra il centro del nastro, la rovescia girando il polso (`joint4`), la rimette dove l'aveva trovata e guarda di nuovo il nastro. Se nessuno dei pezzi rovesciati l'ultima volta è stato riconosciuto, alla volta dopo non la rovescia più ma aspetta che venga cambiata, per non girare a vuoto.
+- In `world.usd` le casse sono corpi mobili da 120 g, così la pinza può sollevarle.
 
 **Disposizione in `world.usd`** (vista dall'alto, il robot guarda verso −x):
 

@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -61,10 +62,13 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from piece_vision import FINGER_MARGIN, MAX_GAP, PieceLibrary, TableMap, finger_position, mold_bins, mold_parts
+from piece_vision import FINGER_MARGIN, MAX_GAP, PieceLibrary, TableMap, finger_position, mold_parts
+from sorter_web import Board, WebServer, default_state_file
 
 # ---------------------------------------------------------------- what goes where
 MOLD_FILE = os.environ.get('MOLD_FILE', 'shared/mold.txt')  # the mold in production: its parts are what comes on the belt
+BINS_CHANGED_FILE = 'shared/.bins_changed'  # bins changed on the web page, one per line, for Isaac Sim to empty them
+WEB_PORT = 8080                     # of the web page: the bins, what is in them, what the robot is doing
 
 # ---------------------------------------------------------------- robot
 FRAME = 'link_base'                 # every position below is in this frame
@@ -155,6 +159,12 @@ TRAVEL_CLEARANCE = 0.06             # TCP above the bin rims and what stands in 
 CARRY_CLEARANCE = 0.035             # bottom of a carried piece above the bin rims and the pieces on the table
 RELEASE_CLEARANCE = 0.015           # bottom of a piece above the rim of its bin when let go: from higher it bounces out
 BIN_CORNER_GAP = 0.02               # m from the inner walls of a bin to where a tall piece is dropped
+# emptying the rejects on the belt: a bin is taken by the wall nearest to the belt, lifted over everything, tipped over
+# above the belt by turning the wrist (joint4), and put back where it was
+DUMP_GRIP_DEPTH = 0.03              # m of the wall between the fingers, from the rim down
+DUMP_BOTTOM = 0.17                  # m of the bottom of a lifted bin above the table: over the other bins and the belt
+DUMP_TURN = 2.2                     # rad of joint4 that tips a bin upside down, more or less
+DUMP_WAIT = 2.0                     # s of wall clock for what is in it to fall out
 PIECE_MARGIN = 0.01                 # around the pieces on the table, for the planner
 NEIGHBOR_GAP = 0.03                 # pieces closer than this to the one being taken: room for the fingers comes from the map
 PLANNING_TIME = 2.0
@@ -207,10 +217,12 @@ class PickAndPlace(Node):
         self.apply_scene_client = self.create_client(ApplyPlanningScene, 'apply_planning_scene')
         self.get_scene_client = self.create_client(GetPlanningScene, 'get_planning_scene')
         self.mold = None
-        self.piece_bins = {}                        # part number -> bin, of the mold
-        self.reject_bin = None
         self.bins = []                              # found at the start, piece_vision.Bin
         self.library = None
+        self.board = Board(default_state_file('shared'), mold_parts(MODELS), (WORK_X[0], WORK_X[1], WORK_Y[0], WORK_Y[1]))
+        self.board.on_mold = self.mold_from_page
+        self.board.on_changed = self.bin_changed
+        self.recovered = None                       # pieces sorted since the rejects were last emptied on the belt
         self.load_mold(mold)
         self.joints = {}
         self.joints_stamp = 0.0
@@ -259,18 +271,30 @@ class PickAndPlace(Node):
             raise RuntimeError('mold {} unknown, the ones in {}: {}'.format(mold, MODELS, ', '.join(sorted(parts))))
         self.library = PieceLibrary(MODELS, parts[mold])
         self.mold = mold
+        self.board.set_mold(mold)
         if self.bins:
-            self.assign_bins()
+            self.log_bins_use()
 
-    def assign_bins(self):
-        """The parts of the mold into the first bins, the unknown pieces into the last one."""
-        try:
-            self.piece_bins = mold_bins(MODELS, self.mold, len(self.bins))
-        except ValueError as e:
-            raise RuntimeError(str(e))
-        self.reject_bin = len(self.bins) - 1
+    def log_bins_use(self):
+        """What the bins are for (set on the web page), in the words batch_test.py reads."""
+        parts = ['{} into bin {}'.format(code, self.board.bins_for(code)[0])
+                 for code in self.board.molds[self.mold] if self.board.bins_for(code)]
+        rejects = self.board.bins_for(None)
         self.get_logger().info('mold {}: {}, unknown pieces into bin {}'.format(
-            self.mold, ', '.join('{} into bin {}'.format(n, b) for n, b in self.piece_bins.items()), self.reject_bin))
+            self.mold, ', '.join(parts) or 'no bin for its parts', rejects[0] if rejects else 'none'))
+
+    def mold_from_page(self, mold):
+        """A mold chosen on the web page: for the belt, and for the robot at its next look at the table."""
+        temporary = Path(MOLD_FILE + '.tmp')
+        temporary.write_text(mold + '\n')
+        temporary.replace(MOLD_FILE)
+
+    def bin_changed(self, found):
+        """A full bin changed for an empty one, says the web page. Isaac Sim empties it (shared/conveyor_cycle.py)."""
+        with open(BINS_CHANGED_FILE, 'a') as f:
+            f.write(json.dumps({'center': list(found['center']), 'length': found['length'], 'width': found['width'],
+                                'angle': found['angle']}) + '\n')
+        self.recovered = None
 
     def on_robot_description(self, msg):
         for joint in ET.fromstring(msg.data).iter('joint'):
@@ -477,6 +501,8 @@ class PickAndPlace(Node):
 
     def scan(self):
         """Look at the table from above and return its map."""
+        self.load_mold()                    # the web page can have changed it
+        self.board.set_status('guarda il nastro')
         self.move_to(make_pose(*SCAN_XYZ, top_down(SCAN_YAW)), 'scan', FREE_SPEED)
         table = TableMap(TABLE_TOP_Z, WORK_X, WORK_Y, [ROBOT_KEEP_OUT])
         self.add_view(table)
@@ -815,6 +841,7 @@ class PickAndPlace(Node):
             self.move_linear(make_pose(grasp.x, grasp.y, carry_z, top_down(yaw)), 'lift')
             self.check_grip_at_rest('lift')     # still over the table: after this, the fingers never open before the bin
             self.restore_neighbors()
+            self.board.set_phase('carry')
         except PieceDropped as e:
             # it falls back from up to the carry height and lands centimeters away: grasps from the old map miss it
             raise PieceDropped('the piece slipped out: {}'.format(e))
@@ -849,6 +876,91 @@ class PickAndPlace(Node):
                          key=lambda corner: -math.hypot(*corner))
         return corners[self.tall_in_bin[bin_index] % len(corners)]
 
+    def bins_text(self, number):
+        """Where a piece of this number goes, for the log."""
+        if number and self.board.bins_for(number):
+            return 'bin {}'.format(', '.join(str(i) for i in self.board.bins_for(number)))
+        rejects = self.board.bins_for(None)
+        return 'reject bin {}'.format(', '.join(str(i) for i in rejects)) if rejects else 'no bin'
+
+    def bin_for(self, number):
+        """The bin a piece goes into now: one of its bins with room; for a piece no bin is for, the rejects. When they
+        are all full the robot waits until the web page says one was changed."""
+        if number is None or not self.board.bins_for(number):
+            number = None
+        return self.board.target(number)
+
+    def empty_full_rejects(self):
+        """Empty a full bin of rejects on the belt: True if it did. Not when none of those emptied the last time came out
+        known: then it waits to be changed, like any other full bin."""
+        for index in self.board.bins_for(None):
+            if self.board.full(index) and self.recovered != 0:
+                self.empty_on_belt(index)
+                return True
+        return False
+
+    def empty_on_belt(self, index):
+        """Take a bin by its wall nearest to the belt, tip it over above the middle of the belt, put it back."""
+        found = self.bins[index]
+        self.board.set_status('svuota la cassa {} sul nastro'.format(index))
+        self.get_logger().info('bin {} is full of rejects: emptying it on the belt'.format(index))
+        belt_x, belt_y = (WORK_X[0] + WORK_X[1]) / 2, (WORK_Y[0] + WORK_Y[1]) / 2
+        c, s = math.cos(found.angle), math.sin(found.angle)
+        out_l, out_w = (found.length + found.wall) / 2, (found.width + found.wall) / 2
+        walls = [((found.center[0] + u * c - v * s, found.center[1] + u * s + v * c), normal)
+                 for u, v, normal in ((out_l, 0, found.angle), (-out_l, 0, found.angle),
+                                      (0, out_w, found.angle + math.pi / 2), (0, -out_w, found.angle + math.pi / 2))]
+        (gx, gy), normal = min(walls, key=lambda w: math.hypot(w[0][0] - belt_x, w[0][1] - belt_y))
+        grip_z = TABLE_TOP_Z + found.rim - DUMP_GRIP_DEPTH
+        lift_z = grip_z + DUMP_BOTTOM               # the whole bin goes up as much
+        travel = TABLE_TOP_Z + max(self.bin_rim(), self.bin_top) + TRAVEL_CLEARANCE
+        yaw = self.closest_yaw(gx, gy, travel, normal + math.pi / 2)   # the fingers close across the wall
+        q = top_down(yaw)
+        obj = self.bin_object(index)
+        self.gripper(finger_position(min(found.wall + 2 * FINGER_MARGIN, MAX_GAP)), 'open', wait=False)
+        self.move_to(make_pose(gx, gy, travel, q), 'above the wall of bin {}'.format(index), FREE_SPEED)
+        self.remove_objects(obj.id)                 # the fingers go around its wall
+        holding = False
+        try:
+            self.move_linear(make_pose(gx, gy, grip_z, q), 'onto the wall')
+            self.close_on(found.wall)
+            self.attach_object(obj)
+            holding = True
+            self.move_linear(make_pose(gx, gy, lift_z, q), 'lift the bin')
+            # the bin turns with the arm, like a piece (carry_to_bin): its middle over the middle of the belt
+            turn = wrapped(math.atan2(belt_y, belt_x) - math.atan2(found.center[1], found.center[0]))
+            ox, oy = gx - found.center[0], gy - found.center[1]
+            over = (belt_x + ox * math.cos(turn) - oy * math.sin(turn), belt_y + ox * math.sin(turn) + oy * math.cos(turn))
+            self.move_to(make_pose(over[0], over[1], lift_z, top_down(yaw + turn)), 'bin over the belt', CARRY_SPEED)
+            upright = {j: self.joints[j] for j in ARM_JOINTS}
+            low, high = self.joint_limits.get('joint4', (-math.inf, math.inf))
+            tipped = False
+            for sign in (1, -1):
+                if low <= upright['joint4'] + sign * DUMP_TURN <= high:
+                    try:
+                        self.move_joints(dict(upright, joint4=upright['joint4'] + sign * DUMP_TURN), 'tip the bin over', CARRY_SPEED)
+                        tipped = True
+                        break
+                    except RuntimeError as e:
+                        self.get_logger().warn(str(e))
+            if tipped:
+                time.sleep(DUMP_WAIT)
+                self.move_joints(upright, 'turn the bin back', CARRY_SPEED)
+            self.move_to(make_pose(gx, gy, lift_z, q), 'bin back over its place', CARRY_SPEED)
+            self.move_linear(make_pose(gx, gy, grip_z + 0.003, q), 'put the bin down')
+            if not tipped:
+                raise RuntimeError('bin {}: it cannot be tipped over above the belt, put back full'.format(index))
+        finally:
+            self.gripper(self.finger_samples_since(0.0)[-1][1] - GRIPPER_RELEASE, 'release')
+            if holding:
+                self.detach_object(obj.id)
+            self.add_objects(self.bin_object(index))
+        self.move_linear(make_pose(gx, gy, travel, q), 'leave the bin')
+        self.board.emptied(index)
+        self.tall_in_bin[index] = 0
+        self.recovered = 0
+        self.get_logger().info('bin {} emptied on the belt'.format(index))
+
     def find_bins(self):
         """How many bins there are, where and how large: looking from above at both sides of the belt and over it."""
         objects = self.call(self.get_scene_client, GetPlanningScene.Request(components=PlanningSceneComponents(
@@ -870,6 +982,7 @@ class PickAndPlace(Node):
         for i, b in enumerate(self.bins):
             self.get_logger().info('bin {}: {:.0f} x {:.0f} mm inside, rim {:.0f} mm, at ({:.3f}, {:.3f}), turned {:.0f} deg'.format(
                 i, b.length * 1000, b.width * 1000, b.rim * 1000, b.center[0], b.center[1], math.degrees(b.angle) % 180))
+        self.board.set_bins(self.bins)
 
     def find_pieces(self, table):
         """The pieces in the map, taking apart the ones that touch as far as their heights allow."""
@@ -913,7 +1026,7 @@ class PickAndPlace(Node):
                 self.get_logger().warn('{}, {}: no way to hold it, left on the table'.format(name, what))
                 continue
             self.get_logger().info('{}, {}: {}, grasp ({:.3f}, {:.3f}, {:.3f}) yaw {:.0f} deg, {:.0f} mm wide'.format(
-                name, what, 'bin {}'.format(self.piece_bins[number]) if number else 'reject bin {}'.format(self.reject_bin),
+                name, what, self.bins_text(number),
                 grasp.x, grasp.y, grasp.z, math.degrees(grasp.yaw), grasp.width * 1000))
             plans.append((piece, number, grasp))
         return plans, len(pieces)
@@ -926,8 +1039,9 @@ class PickAndPlace(Node):
             if time.monotonic() > end:
                 raise RuntimeError('no joint states or no robot_description published')
             time.sleep(0.05)
+        self.board.set_status('cerca le casse')
         self.find_bins()
-        self.assign_bins()
+        self.log_bins_use()
         self.clear_pieces()
         self.add_objects(self.table_object(), *[self.bin_object(i) for i in range(len(self.bins))])
 
@@ -938,6 +1052,7 @@ class PickAndPlace(Node):
         rejected = 0
         total = 0
         tried = []          # grasps that have been used: a piece still on the table did not work with them
+        self.empty_full_rejects()               # full from before: after a restart, or a run that ended there
         for round_number in range(MAX_ROUNDS + 1):
             table = self.scan()
             plans, on_table = self.recognize(table, tried)
@@ -955,36 +1070,50 @@ class PickAndPlace(Node):
             plans.sort(key=lambda plan: -plan[0].height)   # the tall ones topple if something touches them
             for i, (piece, number, grasp) in enumerate(plans):
                 tallest_left = plans[i + 1][0].height if i + 1 < len(plans) else 0.0
-                bin_index = self.piece_bins[number] if number else self.reject_bin
                 name = number or 'unknown piece'
+                bin_index = self.bin_for(number)
+                if bin_index is None:
+                    self.get_logger().warn('{}: no bin is for it, left on the table'.format(name))
+                    continue
+                known = self.board.use[bin_index] == number
                 dropped = False
                 for _ in range(GRASP_ATTEMPTS):
                     tried.append(grasp)
                     try:
+                        self.board.set_status('prende {} per la cassa {}'.format(number[-5:] if number else 'uno sconosciuto', bin_index),
+                                              {'code': number, 'from': list(piece.center), 'to': bin_index, 'phase': 'pick'})
                         self.pick_and_drop(piece, grasp, bin_index, tallest_left, [p for p, _, _ in plans[i + 1:]])
+                        self.board.add(bin_index, number if known else None)
+                        self.board.set_status('{} nella cassa {}'.format(number[-5:] if known else 'scarto', bin_index))
                         if piece.height > self.bins[bin_index].rim:
                             self.tall_in_bin[bin_index] += 1
                             self.bin_top = max(self.bin_top, self.bins[bin_index].wall + piece.height)
-                        if number:
+                        if known:
                             placed += 1
+                            if self.recovered is not None:
+                                self.recovered += 1
                             self.get_logger().info('{} placed, {:.1f} s since the start'.format(number, time.monotonic() - start))
                         else:
                             rejected += 1
                             self.get_logger().info('unknown piece into the reject bin, {:.1f} s since the start'.format(
                                 time.monotonic() - start))
+                            dropped = self.empty_full_rejects()     # then they are on the belt: look at it again
                         break
                     except PieceDropped as e:
                         self.get_logger().warn('{}: {}'.format(name, e))
+                        self.board.set_status('{}: perso, guarda di nuovo'.format(name))
                         dropped = True
                         break
                     except RuntimeError as e:
                         self.get_logger().warn('{}: {}'.format(name, e))
+                        self.board.set_status('{}: {}'.format(name, e))
                     grasp = table.grasp(piece, tried)
                     if grasp is None:
                         break
                 if dropped:
                     break       # it can have landed anywhere, even on the next piece: look at the table again
         self.gripper(GRIPPER_OPEN, 'open')
+        self.board.set_status('fatto: {} nelle casse, {} negli scarti, {} lasciati'.format(placed, rejected, on_table))
         missing = 0 if dry_run else max(total - placed - rejected - on_table, 0)
         self.get_logger().info('done: {} dropped into the bins, {} into the reject bin, {} on the table, {} lost, {:.1f} s'.format(
             placed, rejected, on_table, missing, time.monotonic() - start))
@@ -1013,6 +1142,7 @@ class PickAndPlace(Node):
         self.prepare()
         self.move_to(make_pose(*SCAN_XYZ, top_down(SCAN_YAW)), 'scan', FREE_SPEED)
         self.tell_belt('waiting')
+        self.board.set_status('aspetta che il nastro si fermi')
         self.get_logger().info('waiting for the belt to stop')
         last = None                 # the number of the round, not the moving in between, which can pass unseen
         placed = 0
@@ -1046,6 +1176,7 @@ class PickAndPlace(Node):
                     except RuntimeError as e:
                         self.get_logger().error('round {}: {}'.format(last, e))
                     self.tell_belt('done', last)
+                    self.board.set_status('giro {} finito, aspetta il nastro'.format(last))
                     self.get_logger().info('{} rounds, {} pieces dropped into the bins so far'.format(rounds, placed))
                     waiting_since = time.monotonic()
                 time.sleep(0.1)
@@ -1059,12 +1190,16 @@ def main():
     parser.add_argument('--depth-topic', help='depth image to use, e.g. the one of depth_noise.py (default: the topic ending '
                                               'in {})'.format(DEPTH_TOPIC))
     parser.add_argument('--conveyor', action='store_true', help='work with the belt round after round, until Ctrl-C')
+    parser.add_argument('--web-port', type=int, default=WEB_PORT, help='of the web page (0: none)')
     parser.add_argument('--mold', help='the mold in production (e.g. 940016509): written into {} for the belt as well, which '
                                        'otherwise says it'.format(MOLD_FILE))
     args = parser.parse_args(remove_ros_args(sys.argv)[1:])
 
     rclpy.init(args=sys.argv)
     node = PickAndPlace(args.depth_topic, args.mold)
+    if args.web_port:
+        WebServer(node.board, args.web_port)
+        node.get_logger().info('web page: http://<this PC>:{}'.format(args.web_port))
     try:
         if args.conveyor:
             node.follow_conveyor()

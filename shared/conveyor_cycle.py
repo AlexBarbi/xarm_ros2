@@ -17,6 +17,7 @@ Isaac Sim asks before running a script that comes with a stage: start it with --
 or say yes to the dialog.
 """
 
+import json
 import math
 import os
 import random
@@ -32,6 +33,7 @@ SPEED_ATTRIBUTE = 'physxSurfaceVelocity:surfaceVelocity'
 PIECES_PATH = '/World/Pieces'
 BELT_FILE = '.conveyor_belt'    # what the belt is doing, for pick_and_place.py
 ROBOT_FILE = '.conveyor_robot'  # what pick_and_place.py is doing, for the belt
+BINS_CHANGED = '.bins_changed'  # bins changed on the web page of pick_and_place.py, one per line: emptied here
 
 MOLD_FILE = os.environ.get('MOLD_FILE', '')    # the mold in production; empty: mold.txt next to the stage
 PIECES = 5                      # for each round of the belt
@@ -57,6 +59,8 @@ class ConveyorCycle(BehaviorScript):
     def on_init(self):
         self.made = []
         self.round = 0                  # goes on after Stop: a "done" of before must not count for a round of now
+        self.since_bins = 0.0
+        self.bins_read = 0              # lines of BINS_CHANGED already done
         self.reset()
 
     def on_destroy(self):
@@ -66,6 +70,7 @@ class ConveyorCycle(BehaviorScript):
     def on_play(self):
         self.mold, self.files = None, {}
         self.choose_parts()
+        self.empty_changed_bins(skip=True)     # what was changed before Play is not in this scene
         # where the belt is now: it can be moved in the scene
         cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
         belt = cache.ComputeWorldBound(self.stage.GetPrimAtPath(BELT)).ComputeAlignedRange()
@@ -86,6 +91,10 @@ class ConveyorCycle(BehaviorScript):
 
     def on_update(self, current_time, delta_time):
         self.clock += delta_time
+        self.since_bins += delta_time
+        if self.since_bins > 1.0:
+            self.since_bins = 0.0
+            self.empty_changed_bins()
         if self.waiting:
             if self.clock >= WAIT and self.clock >= self.next_check:
                 self.next_check = self.clock + 1.0
@@ -200,6 +209,34 @@ class ConveyorCycle(BehaviorScript):
         xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(orientation)
         self.made.append(path)
         carb.log_warn('conveyor: {} falling'.format(number))
+
+    def empty_changed_bins(self, skip=False):
+        """A bin changed for an empty one on the web page: the pieces of the belt in it go. skip: only take note of the
+        bins changed so far."""
+        try:
+            lines = (self.folder() / BINS_CHANGED).read_text().splitlines()
+        except OSError:
+            return
+        if not skip:
+            cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+            for line in lines[self.bins_read:]:
+                try:
+                    changed = json.loads(line)
+                except ValueError:
+                    continue
+                c, s = math.cos(changed['angle']), math.sin(changed['angle'])
+                gone = 0
+                for path in list(self.made):
+                    center = cache.ComputeWorldBound(self.stage.GetPrimAtPath(path)).ComputeAlignedRange().GetMidpoint()
+                    dx, dy = center[0] - changed['center'][0], center[1] - changed['center'][1]
+                    if (abs(dx * c + dy * s) < changed['length'] / 2 + 0.01 and abs(-dx * s + dy * c) < changed['width'] / 2 + 0.01
+                            and center[2] < 0.3):
+                        self.stage.RemovePrim(path)
+                        self.made.remove(path)
+                        gone += 1
+                carb.log_warn('conveyor: bin at ({:.3f}, {:.3f}) changed, {} pieces taken away'.format(
+                    changed['center'][0], changed['center'][1], gone))
+        self.bins_read = len(lines)
 
     def remove_pieces(self):
         for path in self.made:

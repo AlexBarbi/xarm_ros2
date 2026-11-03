@@ -53,7 +53,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 from piece_vision import mold_parts  # noqa: E402
-SCENARIOS = ('scene', 'table', 'tipped', 'touching', 'belt')
+SCENARIOS = ('scene', 'table', 'tipped', 'touching', 'belt', 'rejects')
 RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'bins_true', 'bins_found', 'bin_error_mm',
               'bin_size_error_mm', 'bin_rim_error_mm', 'survey_s', 'status', 'exit', 'pieces', 'ok', 'wrong_bin', 'on_table',
               'lost', 'robot_s', 'wall_s', 'real_time_factor', 'in_window', 'drops', 'silent_failure', 'false_alarm',
@@ -193,6 +193,13 @@ def where_is(piece, bins):
     if -0.74 < mean[0] < 0.06 and -0.95 < mean[1] < 0.55 and -0.02 < low[2] < 0.05:
         return 'table', 0.0
     return 'elsewhere', 0.0
+
+
+def seed_full_rejects(path, bins):
+    """The sorter finds the bin of the rejects full (its last bin: right, furthest out), as if it had filled it itself."""
+    rejects = max((b for b in bins if b['center'][1] <= 0), key=lambda b: math.hypot(*b['center']))
+    path.write_text(json.dumps({'bins': [{'x': rejects['center'][0], 'y': rejects['center'][1], 'max': 10,
+                                          'contents': ['unknown'] * 10}], 'use': {}}))
 
 
 def true_bin_of(log, bins):
@@ -584,7 +591,8 @@ class Batch:
         codes = sorted(set(c for m in self.molds for c in self.mold_parts[m]))
         self.isaac = Isaac(args, codes, {'work_x': sorter['WORK_X']})
         self.environment = dict(os.environ, ROS_DOMAIN_ID=str(args.domain), BATCH_WORKSPACE=args.workspace,
-                                MOLD_FILE=str(self.isaac.state / 'mold.txt'))     # the mold of the run, not the one in production
+                                MOLD_FILE=str(self.isaac.state / 'mold.txt'),     # the mold of the run, not the one in production
+                                BINS_STATE_FILE=str(self.isaac.state / 'bins_state.json'))  # empty bins at every run
         self.source = 'source {} && source {}/install/setup.bash && '.format(args.ros_setup, args.workspace)
         self.done = set(r['run'] for r in read_rows(self.folder / 'runs.csv'))
         self.runs_since_start = 0
@@ -648,8 +656,11 @@ class Batch:
         self.runs_since_start += 1
         wait = self.args.belt_timeout if belt else 120.0
         (self.isaac.state / 'mold.txt').write_text(spec['mold'] + '\n')     # the belt and the sorter read it
+        (self.isaac.state / 'bins_state.json').unlink(missing_ok=True)
         start = self.isaac.command(wait, cmd='reset', scenario=spec['scenario'], seed=spec['seed'], count=self.args.pieces,
                                    codes=self.mold_parts[spec['mold']])['snapshot']
+        if spec['scenario'] == 'rejects':
+            seed_full_rejects(self.isaac.state / 'bins_state.json', start['bins'])
         if not start['pieces']:
             raise SystemExit('nessun pezzo nello scenario {}: scene usa quelli salvati in world.usd'.format(spec['scenario']))
         moveit, extras, sorter = None, [], None
@@ -671,7 +682,8 @@ class Batch:
             time.sleep(2.0)
             before = self.isaac.command(30.0, cmd='snapshot')['snapshot']
             began = time.monotonic()
-            sorter = start_process(self.source + 'exec python3 {}/pick_and_place.py{}'.format(self.python, arguments), log_path, self.environment)
+            sorter = start_process(self.source + 'exec python3 {}/pick_and_place.py --web-port 0{}'.format(self.python, arguments),
+                                   log_path, self.environment)
             status = 'done'
             while sorter.poll() is None:
                 if time.monotonic() - began > self.args.run_timeout:
