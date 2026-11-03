@@ -1,0 +1,88 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.3.2"
+    }
+    defaultPrim = "UF_ROBOT"
+    endTimeCode = 1000000
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    startTimeCode = 0
+    subLayers = [
+        @./physics.usda@
+    ]
+    upAxis = "Z"
+)
+
+over "UF_ROBOT"
+{
+    over "Physics"
+    {
+        over "joint1" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "joint2" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "joint3" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "joint4" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "joint5" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "drive_joint" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "left_finger_joint" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "left_inner_knuckle_joint" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "right_outer_knuckle_joint" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "right_finger_joint" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+
+        over "right_inner_knuckle_joint" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+        )
+        {
+        }
+    }
+}
+

@@ -7,3 +7,9 @@ xarm_api/config/xarm_user_params.yaml
 xarm_description/config/kinematics/user
 *.py[cod]
 files__pycache__/
+# shared/: what Isaac Sim and the sorter read, without the CAD of the pieces (copied by hand) and what runs leave
+shared/Studio selezionatore oggetti Volpiano/
+shared/*.before_*
+shared/.conveyor_*
+shared/.batch_*
+shared/*.pt

@@ -20,16 +20,20 @@ from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation
 
 CELL = 0.001                    # height map resolution
-MIN_PIECE_HEIGHT = 0.004        # lower than this is the table
+MIN_PIECE_HEIGHT = 0.008        # lower than this is the table: noise of a real camera, or the belt, 1 mm over it
 MEDIAN_CELLS = 3                # the depth noise goes with a median this wide: wider, it eats the thin ribs of the pieces
 TOP_PERCENTILE = 99.8           # of the height of a piece: the very highest cell is noise
 MAX_PIECE_HEIGHT = 0.14         # higher than this is the gripper in the view
 MIN_PIECE_CELLS = 150
 PIECE_MERGE_CELLS = 3           # parts of the height map closer than twice this are the same piece
 MAX_HIDDEN_CELLS = 3000         # unseen areas smaller than this are shadows of what stands next to them
+PARTIAL_CELLS = 3               # a piece this close to a larger unseen area, or to the edge of the map, is only partly seen
 SPLIT_STEP = 0.002              # height between the slices that take apart pieces touching each other
 
 SIGNATURE_TOLERANCE = 0.009     # worst difference of height / length / width from a resting pose of the part
+OUTLINE_SLACK = 0.08            # rectangles this much larger than the smallest one fit a roundish outline as well: with
+                                # noise a lying 47481 (58 x 42 smallest) measured 65 x 36 and was taken for a 51189. Only
+                                # for pieces no larger than that, or two touching ones (69 x 51) pass for one 51189 (68 x 44)
 SPLIT_TOLERANCE = 0.005         # the same for a slice of a blob: a part of one piece can look like another whole one
 
 # xArm gripper, finger geometry from xarm_gripper.urdf.xacro and left_finger.stl
@@ -69,17 +73,22 @@ def finger_position(gap):
     return float(np.interp(gap, _GAPS[::-1], _POSITIONS[::-1]))
 
 
-def min_area_rectangle(points):
-    """(length, width, angle of the length axis) of the smallest rectangle around 2D points."""
+def hull_rectangles(points):
+    """(area, length, width, angle of the length axis) of the rectangle around 2D points along each edge of their hull."""
     hull = points[ConvexHull(points).vertices]
     edges = np.roll(hull, -1, axis=0) - hull
-    best = None
+    rectangles = []
     for angle in np.arctan2(edges[:, 1], edges[:, 0]):
         c, s = math.cos(angle), math.sin(angle)
         u, v = hull[:, 0] * c + hull[:, 1] * s, -hull[:, 0] * s + hull[:, 1] * c
         du, dv = np.ptp(u), np.ptp(v)
-        if best is None or du * dv < best[0]:
-            best = (du * dv, du, dv, angle) if du >= dv else (du * dv, dv, du, angle + math.pi / 2)
+        rectangles.append((du * dv, du, dv, angle) if du >= dv else (du * dv, dv, du, angle + math.pi / 2))
+    return rectangles
+
+
+def min_area_rectangle(points):
+    """(length, width, angle of the length axis) of the smallest rectangle around 2D points."""
+    best = min(hull_rectangles(points), key=lambda r: r[0])
     return best[1], best[2], best[3]
 
 
@@ -120,20 +129,32 @@ class PieceLibrary:
         with open(path) as f:
             models = json.load(f)
         self.signatures = []        # (part number, height, length, width) of each resting pose
+        self.outlines = []          # the same with the other rectangles that fit its outline almost as tight, and the area
+                                    # of the smallest one (0 for the smallest itself)
         for number in part_numbers:
             points = np.array(models[number]['points'])
             center_of_mass = np.array(models[number]['center_of_mass'])
             for rotation in resting_rotations(points, center_of_mass):
                 p = rotation.apply(points)
+                height = float(np.ptp(p[:, 2]))
                 # as the height map sees it: a flange lower than MIN_PIECE_HEIGHT is part of the table
                 seen = p[p[:, 2] - p[:, 2].min() > MIN_PIECE_HEIGHT]
+                rectangles = hull_rectangles(seen[:, :2])
+                smallest = min(r[0] for r in rectangles)
                 length, width, _ = min_area_rectangle(seen[:, :2])
-                self.signatures.append((number, float(np.ptp(p[:, 2])), length, width))
+                self.signatures.append((number, height, length, width))
+                self.outlines += [(number, height, length, width, 0.0)]
+                self.outlines += [(number, height, r[1], r[2], smallest) for r in rectangles
+                                  if smallest < r[0] <= smallest * (1 + OUTLINE_SLACK)]
 
-    def identify(self, piece):
-        """(part number or None, worst size difference from the best match)"""
+    def identify(self, piece, outlines=True):
+        """(part number or None, worst size difference from the best match). Without outlines only the smallest
+        rectangles: what a slice of a blob is compared to."""
         best, error = None, 1e9
-        for number, height, length, width in self.signatures:
+        area = piece.length * piece.width
+        for number, height, length, width, smallest in (self.outlines if outlines else [s + (0.0,) for s in self.signatures]):
+            if smallest and area > smallest * (1 + OUTLINE_SLACK):
+                continue
             e = max(abs(height - piece.height), abs(length - piece.length), abs(width - piece.width))
             if e < error:
                 best, error = number, e
@@ -149,6 +170,7 @@ class Piece:
     width: float
     angle: float                # of the length axis
     center_of_mass: tuple       # (x, y), estimated from the height map
+    partial: bool = False       # next to what no view has seen: its size is only a lower bound
 
 
 @dataclass
@@ -174,8 +196,10 @@ class TableMap:
         self.x0, self.y0 = x_range[0], y_range[0]
         self.shape = (int(round((x_range[1] - x_range[0]) / CELL)), int(round((y_range[1] - y_range[0]) / CELL)))
         self.height = np.zeros(self.shape)
-        self.views = np.zeros(self.shape)           # the views put together, before segment cleans them up
+        self.views = np.zeros(self.shape)           # sum and number of the views of each cell
+        self.view_count = np.zeros(self.shape, int)
         self.seen = np.zeros(self.shape, bool)
+        self.out_of_view = np.zeros(self.shape, bool)
         self.keep_out = keep_out
         self.labels = None
 
@@ -189,19 +213,21 @@ class TableMap:
         h = points[:, 2] - self.table_z
         keep = (ix >= 0) & (ix < self.shape[0]) & (iy >= 0) & (iy < self.shape[1]) & (h < MAX_PIECE_HEIGHT)
         # In a view, a cell takes the highest of its points: the camera sees the wall of a piece from the side, and all
-        # of it falls in the same cell as the top. Noise only goes after that, view by view: the highest of noisy views
-        # is too high, more so the more views there are, and pieces come out 5 mm taller and 10 mm longer.
+        # of it falls in the same cell as the top. Noise only goes after that, view by view, and the views are averaged:
+        # the highest of noisy views is too high, more so the more views there are, and makes pieces out of nothing.
         view = np.zeros(self.shape)
         seen = np.zeros(self.shape, bool)
         seen[ix[keep], iy[keep]] = True
         np.maximum.at(view, (ix[keep], iy[keep]), h[keep])
         view = np.where(seen, view, ndimage.grey_closing(view, size=3))     # the camera pixels are larger than the cells
-        self.views = np.maximum(self.views, ndimage.median_filter(view, size=MEDIAN_CELLS))
+        known = seen | (view > 0)
+        self.views[known] += ndimage.median_filter(view, size=MEDIAN_CELLS)[known]
+        self.view_count[known] += 1
         self.seen |= seen
 
     def segment(self):
         """Split the height map into pieces."""
-        height = self.views.copy()
+        height = np.divide(self.views, self.view_count, out=np.zeros(self.shape), where=self.view_count > 0)
         xs = self.x0 + (np.arange(self.shape[0]) + 0.5) * CELL
         ys = self.y0 + (np.arange(self.shape[1]) + 0.5) * CELL
         gx, gy = np.meshgrid(xs, ys, indexing='ij')
@@ -214,6 +240,7 @@ class TableMap:
         hidden, _ = ndimage.label(~ndimage.binary_closing(self.seen, iterations=1))
         hidden_cells = np.bincount(hidden.ravel())
         hidden_cells[0] = MAX_HIDDEN_CELLS
+        self.out_of_view = (hidden > 0) & (hidden_cells[hidden] >= MAX_HIDDEN_CELLS)
         self.labels, _ = ndimage.label(grown | (hidden_cells[hidden] < MAX_HIDDEN_CELLS), structure=np.ones((3, 3)))
         self.labels[~mask] = 0
         piece_cells = np.bincount(self.labels.ravel())
@@ -232,8 +259,11 @@ class TableMap:
         u, v = xy[:, 0] * c + xy[:, 1] * s, -xy[:, 0] * s + xy[:, 1] * c
         mid_u, mid_v = (u.min() + u.max()) / 2, (v.min() + v.max()) / 2
         weights = self.height[cells[:, 0], cells[:, 1]]
+        near = ndimage.binary_dilation(self.labels == label, iterations=PARTIAL_CELLS)
+        partial = bool((near & self.out_of_view).any() or cells.min() < PARTIAL_CELLS or
+                       (cells >= np.array(self.shape) - PARTIAL_CELLS).any())
         return Piece(int(label), (mid_u * c - mid_v * s, mid_u * s + mid_v * c), float(np.percentile(weights, TOP_PERCENTILE)),
-                     length, width, angle, tuple(xy.T @ weights / weights.sum()))
+                     length, width, angle, tuple(xy.T @ weights / weights.sum()), partial)
 
     def split(self, piece, library):
         """Pieces that touch are one blob, but in higher and higher slices of it the taller ones come apart from the
@@ -249,7 +279,7 @@ class TableMap:
                 label = self.labels.max() + 1
                 self.labels[cells] = label
                 candidate = self._piece(label)
-                if library.identify(candidate)[1] >= SPLIT_TOLERANCE:
+                if library.identify(candidate, outlines=False)[1] >= SPLIT_TOLERANCE:
                     self.labels[cells] = piece.label
                 else:
                     known.append(candidate)

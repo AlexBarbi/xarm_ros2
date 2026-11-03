@@ -6,6 +6,7 @@ happened from the true positions of the pieces, not from what the script says ab
   python3 batch_test.py --smoke                 # first of all: one run of each scenario, a few minutes
   python3 batch_test.py --hours 12              # as long as you want, Ctrl-C stops it and keeps everything
   python3 batch_test.py --report batch_results/20261102_1530    # the report again, from the data
+  python3 batch_test.py --hours 2 --grip-torque 3.3 --out batch_results/torque_3.3   # another gripper force (30 N), to compare
 
 Results go in batch_results/<date>/, written after every run:
   summary.md    the report: rates overall, by scenario and for each code, what got confused with what, the failed runs
@@ -14,8 +15,14 @@ Results go in batch_results/<date>/, written after every run:
   events.csv    what went wrong for each code (slips, empty grasps, losses)
   logs/         the log of the runs that failed, and of the first few
 
-Scenarios: scene (world.usd as it is), table (pieces at random, on the table), tipped (the same, many on their side),
-touching (pairs of pieces in contact), belt (a round of the conveyor). --out on an existing folder goes on from there.
+Scenarios: table (pieces at random, on the table), tipped (the same, many on their side), touching (pairs of pieces in
+contact), belt (a round of the conveyor), scene (the pieces saved in world.usd, if any). --out on an existing folder
+goes on from there.
+
+"Simulazione esplosa" in the report: the simulated gripper linkage tore (the arm half a radian or more away from where it
+is told to be, for half a second), and the run stopped there. It happens on narrow grasps, during the close or the lift.
+It is Isaac Sim, not the sorter: count those runs apart. With 5 N*m (45 N) there were 5 in a day of tests, with 2.2 N*m
+(20 N, now in world.usd) none in 8 runs on the same layouts: too few to call it fixed.
 
 Runs one sort at a time, without --conveyor: on the belt it starts when the belt has stopped, and the belt waits for it.
 Only the codes active in PIECE_BINS of pick_and_place.py are used, on the table and on the belt.
@@ -48,6 +55,10 @@ RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'status', 'exit', '
 PIECE_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'piece', 'code', 'target_bin', 'outcome', 'where', 'said',
                 'recognition', 'seen_mm', 'grasp_found', 'x', 'y', 'over_rim_mm']
 EVENT_FIELDS = ['run', 'scenario', 'noise', 'code', 'kind', 'count']
+MAX_JOINT4 = 3.2                # rad: past its stop it has torn loose, even if the fingers are still somewhere near
+MIN_FINGER = -0.1               # rad of drive_joint: the same, it stops at 0
+MAX_TRACKING = 0.5              # rad between where an arm joint is told to be and where it is, for half a second: the
+                                # gripper linkage tore and the arm with it (normal motions at full speed: 0.11)
 BIN_MARGIN = 0.058              # m from the center of a bin to its inner wall, plus 1 mm
 BIN_INNER = 0.057
 MATCH_DISTANCE = 0.07           # m between where the camera says a piece is and where it is
@@ -56,7 +67,8 @@ SEEN = re.compile(r'^(?:(\d{12})|unknown piece), (\d+) x (\d+) x (\d+) mm at \((
 CODE_EVENT = re.compile(r'^(\d{12}): (.*)$')
 PLACED = re.compile(r'^(\d{12}) placed,')
 DONE = re.compile(r'^done: (\d+) dropped into the bins, (\d+) on the table, (\d+) lost, ([\d.]+) s')
-EVENT_KINDS = (('slipped out', 'slip'), ('lost during', 'lost_in_transport'), ('nothing between', 'empty_grasp'),
+EVENT_KINDS = (('slipped out', 'slip'), ('may have fallen', 'closed_in_transport'), ('lost during', 'lost_in_transport'),
+               ('nothing between', 'empty_grasp'),
                ('MoveIt error', 'moveit_error'), ('no collision-free IK', 'no_ik'), ('folded', 'no_ik'))
 
 
@@ -72,6 +84,14 @@ class StackDown(Exception):
 
 
 # ---------------------------------------------------------------- reading what happened
+
+def read_worst(path):
+    """What watch_joints.py has seen so far, {} before it has written anything."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
 
 def sorter_constants(path):
     """PIECE_BINS and BINS_XY of pick_and_place.py, without importing it: it needs ROS."""
@@ -279,11 +299,12 @@ def write_report(folder, command=''):
         rows.append([code, part[0]['target_bin'], n, rate(tally['ok'], n), tally['wrong_bin'], tally['on_table'], tally['lost'],
                      percent(seen['right'], n), percent(seen['wrong'], n), percent(seen['unknown'], n), percent(seen['not_seen'], n),
                      percent(sum(p['recognition'] == 'right' and p['grasp_found'] == '0' for p in part), n),
-                     count[(code, 'slip')], count[(code, 'empty_grasp')], count[(code, 'lost_in_transport')]])
+                     count[(code, 'slip')], count[(code, 'empty_grasp')],
+                     count[(code, 'closed_in_transport')] + count[(code, 'lost_in_transport')]])
     out += ['## Per codice', '',
             'Le ultime tre colonne contano gli eventi, attribuiti al codice che lo script credeva di avere in mano.', '']
     out += table(['Codice', 'Bin', 'Pezzi', 'Nel bin giusto', 'Bin sbagliato', 'Sul tavolo', 'Persi', 'Riconosciuto', 'Scambiato',
-                  'Sconosciuto', 'Non visto', 'Senza presa', 'Scivolati', 'Prese a vuoto', 'Persi in trasporto'], rows)
+                  'Sconosciuto', 'Non visto', 'Senza presa', 'Scivolati', 'Prese a vuoto', 'Dita chiuse in trasporto'], rows)
     confused = collections.Counter((p['code'], p['said']) for p in pieces if p['recognition'] == 'wrong')
     if confused:
         out += ['## Scambi di riconoscimento', '']
@@ -346,6 +367,7 @@ class Isaac:
         self.inside = (Path(args.container_shared) / name) if args.container else self.state
         self.message = 0
         self.running = None
+        self.conveyor_wait = 1000000    # the belt must not restart under the robot here: --belt-window measures the round
 
     def shell(self, command):
         """A command where Isaac Sim lives."""
@@ -364,10 +386,10 @@ class Isaac:
         shutil.copy(HERE / 'batch_sim.py', self.state / 'batch_sim.py')
         root = Path(self.args.container_shared) if self.args.container else self.shared
         (self.state / 'config.json').write_text(json.dumps(
-            {'stage': str(root / self.args.stage), 'pool': self.args.pool, 'belt': belt, 'codes': sorted(self.codes)}))
-        # the belt must not restart under the robot here: how long a round takes is measured against --belt-window
-        run = 'cd /tmp && ROS_DOMAIN_ID={} CONVEYOR_WAIT=1000000 CONVEYOR_CODES={} {}/python.sh {}/batch_sim.py {} > {}/sim.log 2>&1'.format(
-            self.args.domain, ','.join(sorted(self.codes)), self.args.isaac_path, self.inside, self.inside, self.inside)
+            {'stage': str(root / self.args.stage), 'pool': self.args.pool, 'belt': belt, 'codes': sorted(self.codes),
+             'grip_torque': self.args.grip_torque}))
+        run = 'cd /tmp && ROS_DOMAIN_ID={} CONVEYOR_WAIT={} CONVEYOR_CODES={} {}/python.sh {}/batch_sim.py {} > {}/sim.log 2>&1'.format(
+            self.args.domain, self.conveyor_wait, ','.join(sorted(self.codes)), self.args.isaac_path, self.inside, self.inside, self.inside)
         if self.args.container:
             subprocess.run(['docker', 'exec', '-d', self.args.container, 'bash', '-c', run], check=True)
         else:
@@ -448,6 +470,13 @@ class Batch:
         """Blocks of runs, round and round the scenarios and the settings: wherever it stops, they are all there."""
         args = self.args
         index = 0
+        for item in args.replay:
+            index += 1
+            scenario, seed = item.split(':')
+            yield {'run': 'r{:05d}_{}'.format(index, scenario), 'scenario': scenario, 'noise': args.noise[0],
+                   'gripper': args.gripper[0], 'seed': int(seed)}
+        if args.replay:
+            return
         rng = random.Random(args.seed)
         while True:
             for scenario in args.scenarios:
@@ -485,11 +514,17 @@ class Batch:
         self.runs_since_start += 1
         wait = self.args.belt_timeout if belt else 120.0
         start = self.isaac.command(wait, cmd='reset', scenario=spec['scenario'], seed=spec['seed'], count=self.args.pieces)['snapshot']
+        if not start['pieces']:
+            raise SystemExit('nessun pezzo nello scenario {}: scene usa quelli salvati in world.usd'.format(spec['scenario']))
         moveit, extras, sorter = None, [], None
         log_path = self.folder / 'logs' / '{}.log'.format(spec['run'])
         try:
             moveit = self.start_moveit(spec['run'])
             arguments = ''
+            watch_file = self.folder / 'logs' / 'joints.tmp'
+            watch_file.unlink(missing_ok=True)
+            extras.append(start_process(self.source + 'exec python3 {}/watch_joints.py {}'.format(HERE, watch_file),
+                                        self.folder / 'logs' / 'watch.tmp', self.environment))
             if spec['noise'] > 0:
                 extras.append(start_process(self.source + 'exec python3 {}/depth_noise.py --strength {}'.format(self.python, spec['noise']),
                                             self.folder / 'logs' / 'noise.tmp', self.environment))
@@ -506,6 +541,8 @@ class Batch:
                 if time.monotonic() - began > self.args.run_timeout:
                     status = 'timeout'
                     break
+                if read_worst(watch_file).get('tracking', 0.0) > MAX_TRACKING:
+                    break               # nothing works after that, no use waiting for the script to give up
                 self.isaac.check_alive()
                 time.sleep(0.5)
             code = sorter.poll()
@@ -518,7 +555,9 @@ class Batch:
                 stop_process(process)
             stop_process(moveit)
         fingers = [abs(v) for finger in end['fingers'] for v in finger]
-        if not end['fingers'] or any(v != v or v > 2.0 for v in fingers):
+        worst = read_worst(watch_file)
+        if (not end['fingers'] or any(v != v or v > 2.0 for v in fingers) or worst.get('joint4', 0.0) > MAX_JOINT4 or
+                worst.get('finger_min', 0.0) < MIN_FINGER or worst.get('tracking', 0.0) > MAX_TRACKING):
             status = 'exploded'
             self.isaac.running = None           # do not trust it for the next run
         return self.record(spec, status, code, start, before, end, wall, log_path)
@@ -548,6 +587,8 @@ class Batch:
             log_path.unlink(missing_ok=True)    # the good ones only take space, after the first few
         elif all_ok:
             self.kept_logs += 1
+        else:
+            shutil.copy(self.folder / 'logs' / 'moveit.tmp', self.folder / 'logs' / '{}.moveit.log'.format(spec['run']))
         return result
 
     def run(self):
@@ -598,10 +639,13 @@ def parse_arguments():
     parser.add_argument('--smoke', action='store_true', help='one run of each scenario, to see that it all works')
     parser.add_argument('--report', help='write the report of this folder again and exit')
     parser.add_argument('--out', help='results folder, an existing one goes on from where it stopped')
-    parser.add_argument('--scenarios', default='scene,table,tipped,touching,belt', help='any of ' + ','.join(SCENARIOS))
+    parser.add_argument('--replay', nargs='+', default=[], metavar='SCENARIO:SEED', help='only these runs, e.g. the failed ones of a report')
+    parser.add_argument('--scenarios', default='table,tipped,touching,belt', help='any of ' + ','.join(SCENARIOS))
     parser.add_argument('--noise', default='0,1', help='strengths of depth_noise.py, 0 is the perfect camera')
     parser.add_argument('--gripper', default='sim', help='sim, driver (the action of the real arm over the simulated gripper), or both')
     parser.add_argument('--pieces', type=int, default=5, help='on the table in each run')
+    parser.add_argument('--grip-torque', type=float, help='N*m of the gripper motor in Isaac Sim, in place of the 2.2 of world.usd '
+                                                          '(N on the piece x 0.11: one motor, two fingers, 0.055 m of lever)')
     parser.add_argument('--pool', type=int, default=3, help='pieces of each code loaded in Isaac Sim')
     parser.add_argument('--block', type=int, default=5, help='runs in a row of each combination')
     parser.add_argument('--seed', type=int, default=1, help='of the sequence of layouts: the same one gives the same runs')
@@ -631,6 +675,8 @@ def parse_arguments():
     args.gripper = ['sim', 'driver'] if args.gripper == 'both' else [args.gripper]
     if args.smoke:
         args.noise, args.block, args.runs = [args.noise[-1]], 1, len(args.scenarios)
+    if args.replay:
+        args.runs = len(args.replay)
     if not args.out:
         args.out = str(Path(args.workspace) / 'batch_results' / time.strftime('%Y%m%d_%H%M'))
     return args

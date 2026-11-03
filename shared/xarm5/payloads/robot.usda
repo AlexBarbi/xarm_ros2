@@ -1,0 +1,222 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.3.2"
+    }
+    defaultPrim = "UF_ROBOT"
+    endTimeCode = 1000000
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    startTimeCode = 0
+    upAxis = "Z"
+)
+
+over "UF_ROBOT" (
+    prepend apiSchemas = ["IsaacRobotAPI"]
+)
+{
+    prepend rel isaac:physics:robotJoints = [
+        </UF_ROBOT/Physics/root_joint>,
+        </UF_ROBOT/Physics/joint1>,
+        </UF_ROBOT/Physics/joint2>,
+        </UF_ROBOT/Physics/joint3>,
+        </UF_ROBOT/Physics/joint4>,
+        </UF_ROBOT/Physics/joint5>,
+        </UF_ROBOT/Physics/joint_eef>,
+        </UF_ROBOT/Physics/gripper_fix>,
+        </UF_ROBOT/Physics/drive_joint>,
+        </UF_ROBOT/Physics/left_inner_knuckle_joint>,
+        </UF_ROBOT/Physics/right_outer_knuckle_joint>,
+        </UF_ROBOT/Physics/right_inner_knuckle_joint>,
+        </UF_ROBOT/Physics/left_finger_joint>,
+        </UF_ROBOT/Physics/right_finger_joint>,
+    ]
+    prepend rel isaac:physics:robotLinks = [
+        </UF_ROBOT/Geometry/link_base>,
+        </UF_ROBOT/Geometry/link_base/link1>,
+        </UF_ROBOT/Geometry/link_base/link1/link2>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link/left_outer_knuckle>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link/left_outer_knuckle/left_finger>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link/left_inner_knuckle>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link/right_outer_knuckle>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link/right_outer_knuckle/right_finger>,
+        </UF_ROBOT/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link/right_inner_knuckle>,
+    ]
+    token isaac:robotType = "Default"
+
+    over "Geometry"
+    {
+        over "link_base" (
+            prepend apiSchemas = ["IsaacLinkAPI"]
+        )
+        {
+            over "link1" (
+                prepend apiSchemas = ["IsaacLinkAPI"]
+            )
+            {
+                over "link2" (
+                    prepend apiSchemas = ["IsaacLinkAPI"]
+                )
+                {
+                    over "link3" (
+                        prepend apiSchemas = ["IsaacLinkAPI"]
+                    )
+                    {
+                        over "link4" (
+                            prepend apiSchemas = ["IsaacLinkAPI"]
+                        )
+                        {
+                            over "link5" (
+                                prepend apiSchemas = ["IsaacLinkAPI"]
+                            )
+                            {
+                                over "link_eef" (
+                                    prepend apiSchemas = ["IsaacLinkAPI"]
+                                )
+                                {
+                                    over "xarm_gripper_base_link" (
+                                        prepend apiSchemas = ["IsaacLinkAPI"]
+                                    )
+                                    {
+                                        over "left_outer_knuckle" (
+                                            prepend apiSchemas = ["IsaacLinkAPI"]
+                                        )
+                                        {
+                                            over "left_finger" (
+                                                prepend apiSchemas = ["IsaacLinkAPI"]
+                                            )
+                                            {
+                                            }
+                                        }
+
+                                        over "left_inner_knuckle" (
+                                            prepend apiSchemas = ["IsaacLinkAPI"]
+                                        )
+                                        {
+                                        }
+
+                                        over "right_outer_knuckle" (
+                                            prepend apiSchemas = ["IsaacLinkAPI"]
+                                        )
+                                        {
+                                            over "right_finger" (
+                                                prepend apiSchemas = ["IsaacLinkAPI"]
+                                            )
+                                            {
+                                            }
+                                        }
+
+                                        over "right_inner_knuckle" (
+                                            prepend apiSchemas = ["IsaacLinkAPI"]
+                                        )
+                                        {
+                                        }
+
+                                        over "link_tcp" (
+                                            prepend apiSchemas = ["IsaacSiteAPI"]
+                                        )
+                                        {
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    over "Physics"
+    {
+        over "root_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "joint1" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "joint2" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "joint3" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "joint4" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "joint5" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "joint_eef" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "gripper_fix" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "drive_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "left_finger_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "left_inner_knuckle_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "right_outer_knuckle_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "right_finger_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "right_inner_knuckle_joint" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+    }
+}
+

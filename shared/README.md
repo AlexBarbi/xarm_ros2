@@ -1,0 +1,26 @@
+# shared
+
+Quello che leggono Isaac Sim (montato in `/workspace` nel container) e `python/pick_and_place.py`:
+
+- `world.usd`: scena con braccio, tavolo, 11 contenitori e nastro. Il robot è in `xarm5/`.
+- `conveyor_cycle.py`: lo script del nastro, attaccato a `/World/Conveyor`.
+- `piece_models.json`: le forme dei pezzi per il riconoscimento, generate con `export_piece_models.py`.
+- `set_grip_torque.py`: cambia la forza della pinza in `world.usd`. Ora è 2,2 N·m, cioè 20 N sul pezzo.
+- `fastdds_udp.xml`: configurazione DDS per parlare con il container.
+
+Non sono nel repo, vanno copiati a mano:
+
+- `Studio selezionatore oggetti Volpiano/`: i CAD dei pezzi. Servono al nastro e ai batch, che ci prendono i pezzi da far cadere.
+- `synthetic_*.pt`: il modello YOLO, che il programma non usa.
+
+## Su un altro PC
+
+Il codice cerca `shared/` dentro `ros_ws`. Dopo aver clonato il repo in `ros_ws/src/xarm_ros2`:
+
+```bash
+cd ~/Downloads/ros_ws
+ln -s src/xarm_ros2/shared shared          # lo stesso link di questo PC
+cp -r "/percorso/Studio selezionatore oggetti Volpiano" shared/
+```
+
+Poi il container di Isaac Sim va lanciato con `-v ~/Downloads/ros_ws/shared:/workspace`.

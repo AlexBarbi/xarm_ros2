@@ -82,13 +82,17 @@ ARRIVAL_TOLERANCE = 0.03            # rad: the controller gives up at 0.01, and 
                                     # alone pushes the wrist that far
 TCP_LINK = 'link_tcp'               # between the fingertips, 0.172 m from the gripper base
 CAMERA_LINK = 'camera_color_optical_frame'
-DEPTH_TOPIC = '/camera/aligned_depth_to_color/image_raw'
-CAMERA_INFO_TOPIC = '/camera/color/camera_info'
+DEPTH_TOPIC = '/aligned_depth_to_color/image_raw'   # end of the name: /camera/... in Isaac Sim, /camera/camera/... with
+                                                    # realsense-ros 4 (started with align_depth.enable:=true)
+CAMERA_INFO_TOPIC = '/color/camera_info'            # next to it
 GRIPPER_ACTIONS = {'xarm_gripper/gripper_action': GripperCommand,     # end of the action name on the real arm
                    'xarm_gripper_traj_controller/follow_joint_trajectory': FollowJointTrajectory}   # in simulation
 GRIPPER_JOINT = 'drive_joint'
 GRIPPER_OPEN = 0.0
 GRIPPER_CLOSED = 0.85               # fingers touching each other
+GRIPPER_FORCE = 20.0                # N on the piece (the real gripper does 10 to 50): a few N hold these parts, more only
+                                    # strains them; in Isaac Sim it is the maxForce of drive_joint in world.usd, 20 N x 2
+                                    # fingers x 0.055 m of lever = 2.2 N*m (one motor drives both fingers)
 GRIPPER_SPEED = 1.0                 # rad/s of the free motions of the fingers: faster, opening right after a grip tears
                                     # the simulated gripper linkage apart and takes the arm with it (URDF limit: 2)
 GRIPPER_RELEASE = 0.3               # rad opened to let go of a piece: enough, and quick
@@ -97,7 +101,10 @@ GRIPPER_STALL_TIME = 0.2            # s without finger motion while closing = co
 GRIPPER_STALL_TOL = 0.005           # rad of finger motion still counted as stopped
 GRIPPER_HELD_ERROR = 0.01           # rad short of the target = stopped by something, closer = nothing between the fingers
 GRIPPER_MISS_MARGIN = 0.008         # m: the fingers are sent this much closer than the width of the piece
+GRIPPER_PRESS = 0.07                # rad past the contact at least: with less, the fingers bending under the grip get so
+                                    # close to the target that a piece still held looks gone
 GRIPPER_FREE_SAMPLES = 3            # samples of drive_joint in a row at the target, while carrying = the piece is gone
+GRIPPER_SETTLE_TIMEOUT = 5.0        # s of wall clock waiting for the fingers to stop after the lift
 GRIPPER_TIMEOUT = 30.0              # s of wall clock: Isaac Sim can run much slower than real time
 TOUCH_LINKS = ['xarm_gripper_base_link', 'left_outer_knuckle', 'left_finger', 'left_inner_knuckle',
                'right_outer_knuckle', 'right_finger', 'right_inner_knuckle', 'link_tcp']
@@ -143,13 +150,15 @@ MAX_LINE_STEP = 0.5                 # rad of any joint between two points of a s
                                     # arm over, not a line
 IK_ATTEMPTS = 5                     # the IK restarts from random seeds: some land on the arm reaching backwards
 MIN_ELBOW = -math.pi                # joint3 further than this: the elbow folded the other way, reachable but a long way
+TRAVEL_CLEARANCE = 0.06             # TCP above the bin rims and what stands in them, going for a piece
 CARRY_CLEARANCE = 0.035             # bottom of a carried piece above the bin rims and the pieces on the table
 RELEASE_CLEARANCE = 0.015           # bottom of a piece above the rim of its bin when let go: from higher it bounces out
 BIN_CORNER = 0.037                  # from the center of a bin, along x and y, to where a tall piece is dropped
 CORNERS = [(-1, 1), (1, 1), (-1, -1), (1, -1)]  # the arm comes from -y: the far ones first, it does not pass over them
 PIECE_MARGIN = 0.01                 # around the pieces on the table, for the planner
+NEIGHBOR_GAP = 0.03                 # pieces closer than this to the one being taken: room for the fingers comes from the map
 PLANNING_TIME = 2.0
-GRASP_ATTEMPTS = 3                  # grasps of a piece in a row: when one slips the piece stays where it is
+GRASP_ATTEMPTS = 3                  # grasps of a piece in a row: when one misses the piece stays where it is
 MAX_ROUNDS = 4                      # scans of the table with something left to do
 
 PIECE_PREFIX = 'piece'
@@ -159,6 +168,12 @@ TABLE_ID = 'table'
 def top_down(yaw):
     # Rz(yaw) * Rx(pi): TCP z axis pointing down, rotated by yaw about the vertical
     return Quaternion(x=math.cos(yaw / 2), y=math.sin(yaw / 2), z=0.0, w=0.0)
+
+
+def close_to(a, b, gap):
+    """Two pieces on the table nearer than gap, give or take: the circles around their rectangles."""
+    reach = (math.hypot(a.length, a.width) + math.hypot(b.length, b.width)) / 2
+    return math.hypot(a.center[0] - b.center[0], a.center[1] - b.center[1]) < reach + gap
 
 
 def make_pose(x, y, z, q=None):
@@ -180,7 +195,7 @@ class PieceDropped(RuntimeError):
 
 class PickAndPlace(Node):
 
-    def __init__(self, depth_topic=DEPTH_TOPIC):
+    def __init__(self, depth_topic=None):
         super().__init__('pick_and_place')
         self.move_client = ActionClient(self, MoveGroup, 'move_action')
         self.execute_client = ActionClient(self, ExecuteTrajectory, 'execute_trajectory')
@@ -203,10 +218,11 @@ class PickAndPlace(Node):
         self.finger_lock = threading.Lock()
         self.create_subscription(JointState, 'joint_states', self.on_joint_states, 10)
         self.carrying = False                       # arm motions watch the grip meanwhile
+        self.maybe_lost = None                      # the motion during which the fingers closed all the way, if they did
+        self.neighbors = []                         # boxes of pieces out of the planning scene while one next to them is taken
         self.depth = None
         self.camera_info = None
-        self.create_subscription(Image, depth_topic, self.on_depth, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, CAMERA_INFO_TOPIC, self.on_camera_info, qos_profile_sensor_data)
+        self.depth_topic = depth_topic              # None: the one found
 
         # Node.executor is taken by rclpy
         self.spin_executor = SingleThreadedExecutor()
@@ -257,8 +273,28 @@ class PickAndPlace(Node):
             time.sleep(0.2)
         raise RuntimeError('no gripper action, looked for {}'.format(list(GRIPPER_ACTIONS)))
 
+    def find_camera(self, timeout):
+        """The aligned depth image of the wrist camera, wherever its driver puts it, and the camera info next to it."""
+        end = time.monotonic() + timeout
+        depth = self.depth_topic
+        while depth is None:
+            found = sorted(name for name, _ in self.get_topic_names_and_types() if name.endswith(DEPTH_TOPIC))
+            if found:
+                depth = found[0]
+            elif time.monotonic() > end:
+                raise RuntimeError('no topic ending in {}: is the camera driver running, with the depth aligned to the '
+                                   'color image?'.format(DEPTH_TOPIC))
+            else:
+                time.sleep(0.2)
+        info = depth[:depth.rindex('/aligned_depth_to_color/')] + CAMERA_INFO_TOPIC if '/aligned_depth_to_color/' in depth \
+            else depth.rsplit('/', 2)[0] + CAMERA_INFO_TOPIC
+        self.get_logger().info('camera: {}, {}'.format(depth, info))
+        self.create_subscription(Image, depth, self.on_depth, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, info, self.on_camera_info, qos_profile_sensor_data)
+
     def wait_for_servers(self, timeout=15.0):
         self.gripper_client, self.gripper_kind = self.find_gripper(timeout)
+        self.find_camera(timeout)
         for client in (self.move_client, self.execute_client, self.gripper_client):
             if not client.wait_for_server(timeout_sec=timeout):
                 raise RuntimeError('action server {} not available'.format(client._action_name))
@@ -584,6 +620,7 @@ class PickAndPlace(Node):
         if self.gripper_kind is GripperCommand:
             goal = GripperCommand.Goal()
             goal.command.position = float(position)
+            goal.command.max_effort = GRIPPER_FORCE     # the xArm driver of this workspace ignores it, the gripper keeps its own
             return goal
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = [GRIPPER_JOINT]
@@ -610,15 +647,43 @@ class PickAndPlace(Node):
         return len(samples) == count and all(self.grip_target - p < GRIPPER_HELD_ERROR for _, p in samples)
 
     def check_grip(self, motion, what):
-        """Stop an arm motion as soon as the piece it carries is gone, wherever that happens on the way."""
+        """Stop the lift as soon as the piece is gone. Over the bins only take note: a piece can still be held there."""
         if not self.carrying or not self.fingers_free(GRIPPER_FREE_SAMPLES):
+            return
+        if self.grip_target < GRIPPER_CLOSED:
+            # A piece can turn or settle between the fingers, flat to on its side, and they close on it up to the target
+            # while it is still held: the true poses in Isaac showed it lifted 10 cm with the fingers there.
+            self.grip_target = GRIPPER_CLOSED
+            self.gripper(self.grip_target, 'press', wait=False)
+            self.get_logger().info('{}: the fingers closed further, pressing to {:.2f} rad'.format(what, self.grip_target))
+            return
+        if what != 'lift':
+            # Closed all the way is not sure either: a thin part of a piece between the pads holds it, and Isaac showed
+            # one carried into its bin like that. Opening here could drop it into another bin, so it goes on to its own.
+            self.maybe_lost = self.maybe_lost or what
             return
         joints = dict(self.joints)          # the arm is well past this point by the time it has stopped
         self.carrying = False
-        self.wait(motion.cancel_goal_async(), 5.0, what)
-        self.wait(motion.get_result_async(), 10.0, what)
+        if motion:
+            self.wait(motion.cancel_goal_async(), 5.0, what)
+            self.wait(motion.get_result_async(), 10.0, what)
         position = self.link_pose(TCP_LINK, joints)[1]
         raise PieceDropped('lost during {}, around ({:.3f}, {:.3f}, {:.3f})'.format(what, *position))
+
+    def check_grip_at_rest(self, what):
+        """Check the grip once the fingers have stopped: a press can still be closing them on a piece that slipped."""
+        for _ in range(2):          # again after a press
+            target = self.grip_target
+            begin = self.joints_stamp
+            end = time.monotonic() + GRIPPER_SETTLE_TIMEOUT
+            while time.monotonic() < end:
+                recent = [p for t, p in self.finger_samples_since(self.joints_stamp - GRIPPER_STALL_TIME)]
+                if recent and self.joints_stamp - begin >= GRIPPER_STALL_TIME and max(recent) - min(recent) < GRIPPER_STALL_TOL:
+                    break
+                time.sleep(0.01)
+            self.check_grip(None, what)
+            if self.grip_target == target:
+                return
 
     def close_on(self, width):
         """Close on a piece. Raises when the fingers miss it."""
@@ -649,6 +714,9 @@ class PickAndPlace(Node):
         self.grip_contact = self.finger_samples_since(0.0)[-1][1]
         if self.fingers_free():
             raise RuntimeError('close gripper: nothing between the fingers at {:.2f} rad'.format(self.grip_contact))
+        if self.grip_target - self.grip_contact < GRIPPER_PRESS:    # the width was a guess, the contact is measured
+            self.grip_target = min(self.grip_contact + GRIPPER_PRESS, GRIPPER_CLOSED)
+            self.gripper(self.grip_target, 'press', wait=False)
         self.get_logger().info('close gripper: contact at {:.3f} rad, sent to {:.3f}'.format(self.grip_contact, self.grip_target))
 
     # ------------------------------------------------------------ task
@@ -666,7 +734,7 @@ class PickAndPlace(Node):
             raise error
         return min(options)[1]
 
-    def pick_and_drop(self, piece, grasp, bin_index, tallest_left):
+    def pick_and_drop(self, piece, grasp, bin_index, tallest_left, others=()):
         """Take a piece and let it fall into a bin, carrying it over everything left on the table."""
         z = TABLE_TOP_Z + grasp.z
         above = max(z, TABLE_TOP_Z + piece.height + ABOVE_PIECE)
@@ -674,25 +742,44 @@ class PickAndPlace(Node):
         q = top_down(yaw)
         obj = self.piece_object(piece)
         self.gripper(finger_position(min(grasp.width + 2 * FINGER_MARGIN, MAX_GAP)), 'open', wait=False)
-        self.move_to(make_pose(grasp.x, grasp.y, above, q), 'above piece', FREE_SPEED)
-        self.remove_objects(obj.id)         # the fingers go around it
-        self.move_linear(make_pose(grasp.x, grasp.y, z, q), 'approach')
-        self.close_on(grasp.width)
-        self.attach_object(obj)
-        self.carrying = True
+        # at the height of the rims the straight line back from a bin grazes the bins on the way, so down only over the piece
+        travel = max(above, TABLE_TOP_Z + max(BIN_HEIGHT, self.bin_top) + TRAVEL_CLEARANCE)
+        self.move_to(make_pose(grasp.x, grasp.y, travel, q), 'above piece', FREE_SPEED)
+        # The fingers go around it, and next to the pieces it touches: the height map has room for them there, the boxes
+        # of those with the margin for the planner do not, and the piece in the gripper would start in collision with them.
+        self.neighbors = [self.piece_object(other, PIECE_MARGIN) for other in others if close_to(piece, other, NEIGHBOR_GAP)]
+        self.remove_objects(obj.id, *[o.id for o in self.neighbors])
         try:
-            self.carry_to_bin(piece, grasp, bin_index, tallest_left, z, yaw)
+            self.move_linear(make_pose(grasp.x, grasp.y, z, q), 'approach')
+            self.close_on(grasp.width)
+            self.attach_object(obj)
+            self.carrying = True
+            self.maybe_lost = None
+            try:
+                self.carry_to_bin(piece, grasp, bin_index, tallest_left, z, yaw)
+            finally:
+                self.carrying = False
+                self.gripper(self.grip_contact - GRIPPER_RELEASE, 'release')    # never go on with a piece in the gripper
+                self.detach_object(obj.id)
         finally:
-            self.carrying = False
-            self.gripper(self.grip_contact - GRIPPER_RELEASE, 'release')    # never go on with a piece in the gripper
-            self.detach_object(obj.id)
+            self.restore_neighbors()
+        if self.maybe_lost:
+            raise PieceDropped('the fingers closed all the way during {}: the piece may have fallen on the way'.format(self.maybe_lost))
+
+    def restore_neighbors(self):
+        if self.neighbors:
+            self.add_objects(*self.neighbors)
+            self.neighbors = []
 
     def carry_to_bin(self, piece, grasp, bin_index, tallest_left, z, yaw):
         carry_z = z + max(BIN_HEIGHT, self.bin_top, tallest_left) + CARRY_CLEARANCE
         try:
             self.move_linear(make_pose(grasp.x, grasp.y, carry_z, top_down(yaw)), 'lift')
+            self.check_grip_at_rest('lift')     # still over the table: after this, the fingers never open before the bin
+            self.restore_neighbors()
         except PieceDropped as e:
-            raise RuntimeError('the piece slipped out: {}'.format(e))   # it is still about where it was
+            # it falls back from up to the carry height and lands centimeters away: grasps from the old map miss it
+            raise PieceDropped('the piece slipped out: {}'.format(e))
         # the wrist stays as it is and the piece turns with the arm, which the bin does not mind: the center of the
         # piece goes over the center of the bin, and the TCP keeps its offset from it, turned as well
         center_x, center_y = self.bin_spot(piece, bin_index)
@@ -723,12 +810,15 @@ class PickAndPlace(Node):
             pieces.extend(parts or [piece])
         return pieces
 
+    def unsure(self, piece):
+        return piece.partial or not self.library.identify(piece)[0]
+
     def recognize(self, table, tried):
         """(piece, part number, grasp) of everything that can be taken, and how many pieces there are in all."""
         plans = []
         pieces = self.find_pieces(table)
         for _ in range(MAX_LOOKS):
-            unknown = [piece for piece in pieces if not self.library.identify(piece)[0]]
+            unknown = [piece for piece in pieces if self.unsure(piece)]
             if not unknown:
                 break
             try:
@@ -737,7 +827,7 @@ class PickAndPlace(Node):
                 self.get_logger().warn(str(e))
                 break
             again = self.find_pieces(table)
-            if len([piece for piece in again if not self.library.identify(piece)[0]]) >= len(unknown):
+            if len([piece for piece in again if self.unsure(piece)]) >= len(unknown):
                 pieces = again
                 break               # nothing more to see from up here
             pieces = again
@@ -747,6 +837,9 @@ class PickAndPlace(Node):
                 piece.length * 1000, piece.width * 1000, piece.height * 1000, piece.center[0], piece.center[1])
             if number is None:
                 self.get_logger().warn('unknown piece, {}: left on the table'.format(what))
+                continue
+            if piece.partial:   # at the edge of what the camera reaches: a part of one piece can look like a whole other one
+                self.get_logger().warn('unknown piece, {}: only partly in view, left on the table'.format(what))
                 continue
             grasp = table.grasp(piece, tried)
             if grasp is None:
@@ -792,7 +885,7 @@ class PickAndPlace(Node):
                 for _ in range(GRASP_ATTEMPTS):
                     tried.append(grasp)
                     try:
-                        self.pick_and_drop(piece, grasp, PIECE_BINS[number], tallest_left)
+                        self.pick_and_drop(piece, grasp, PIECE_BINS[number], tallest_left, [p for p, _, _ in plans[i + 1:]])
                         placed += 1
                         if piece.height > BIN_HEIGHT:
                             self.tall_in_bin[PIECE_BINS[number]] += 1
@@ -865,7 +958,8 @@ class PickAndPlace(Node):
 def main():
     parser = argparse.ArgumentParser(description='Sort the pieces on the table into their bins (xArm5 + gripper + wrist camera)')
     parser.add_argument('--dry-run', action='store_true', help='only scan, and print what is on the table')
-    parser.add_argument('--depth-topic', default=DEPTH_TOPIC, help='depth image to use, e.g. the one of depth_noise.py')
+    parser.add_argument('--depth-topic', help='depth image to use, e.g. the one of depth_noise.py (default: the topic ending '
+                                              'in {})'.format(DEPTH_TOPIC))
     parser.add_argument('--conveyor', action='store_true', help='work with the belt round after round, until Ctrl-C')
     args = parser.parse_args(remove_ros_args(sys.argv)[1:])
 

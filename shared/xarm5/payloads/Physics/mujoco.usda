@@ -1,0 +1,187 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.3.2"
+    }
+    defaultPrim = "UF_ROBOT"
+    endTimeCode = 1000000
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    startTimeCode = 0
+    subLayers = [
+        @./physics.usda@
+    ]
+    upAxis = "Z"
+)
+
+over "UF_ROBOT"
+{
+    over "Physics"
+    {
+        over "joint1" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "joint2" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "joint3" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "joint4" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "joint5" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "drive_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "left_finger_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "left_inner_knuckle_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "right_outer_knuckle_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "right_finger_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        over "right_inner_knuckle_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+            prepend apiSchemas = ["MjcJointAPI"]
+        )
+        {
+        }
+
+        def MjcActuator "joint1_actuator"
+        {
+            uniform double mjc:forceRange:max = 163.1999969482422
+            uniform double mjc:forceRange:min = -163.1999969482422
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/joint1>
+        }
+
+        def MjcActuator "joint2_actuator"
+        {
+            uniform double mjc:forceRange:max = 163.1999969482422
+            uniform double mjc:forceRange:min = -163.1999969482422
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/joint2>
+        }
+
+        def MjcActuator "joint3_actuator"
+        {
+            uniform double mjc:forceRange:max = 81.5999984741211
+            uniform double mjc:forceRange:min = -81.5999984741211
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/joint3>
+        }
+
+        def MjcActuator "joint4_actuator"
+        {
+            uniform double mjc:forceRange:max = 30.600000381469727
+            uniform double mjc:forceRange:min = -30.600000381469727
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/joint4>
+        }
+
+        def MjcActuator "joint5_actuator"
+        {
+            uniform double mjc:forceRange:max = 30.600000381469727
+            uniform double mjc:forceRange:min = -30.600000381469727
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/joint5>
+        }
+
+        def MjcActuator "drive_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 50
+            uniform double mjc:forceRange:min = -50
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/drive_joint>
+        }
+
+        def MjcActuator "left_finger_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 50
+            uniform double mjc:forceRange:min = -50
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/left_finger_joint>
+        }
+
+        def MjcActuator "left_inner_knuckle_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 50
+            uniform double mjc:forceRange:min = -50
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/left_inner_knuckle_joint>
+        }
+
+        def MjcActuator "right_outer_knuckle_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 50
+            uniform double mjc:forceRange:min = -50
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/right_outer_knuckle_joint>
+        }
+
+        def MjcActuator "right_finger_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 50
+            uniform double mjc:forceRange:min = -50
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/right_finger_joint>
+        }
+
+        def MjcActuator "right_inner_knuckle_joint_actuator"
+        {
+            uniform double mjc:forceRange:max = 50
+            uniform double mjc:forceRange:min = -50
+            custom rel mjc:target
+            append rel mjc:target = </UF_ROBOT/Physics/right_inner_knuckle_joint>
+        }
+    }
+}
+

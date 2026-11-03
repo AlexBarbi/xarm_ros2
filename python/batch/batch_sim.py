@@ -24,7 +24,8 @@ CONFIG = json.load(open(os.path.join(STATE, 'config.json')))
 with open(os.path.join(STATE, 'sim.pid'), 'w') as f:
     f.write(str(os.getpid()))
 
-app = SimulationApp({'headless': True, 'extra_args': ['--/app/scripting/ignoreWarningDialog=true']})
+# the scripts of the stage are only allowed for the belt: the extension that runs them is on in any case
+app = SimulationApp({'headless': True, 'extra_args': ['--/app/scripting/ignoreWarningDialog=true'] if CONFIG['belt'] else []})
 
 from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
 
@@ -36,13 +37,14 @@ app.update()
 import omni.physx  # noqa: E402
 import omni.timeline  # noqa: E402
 import omni.usd  # noqa: E402
-from pxr import Gf, Usd, UsdGeom, UsdPhysics  # noqa: E402
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics  # noqa: E402
 
 PIECES_PATH = '/World/Pieces'
 BELT = '/World/Conveyor/Belt'
 BELT_SPEED = 'physxSurfaceVelocity:surfaceVelocity'
 GRIPPER = '/World/xarm5/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link'
 FINGERS = (GRIPPER + '/left_outer_knuckle/left_finger', GRIPPER + '/right_outer_knuckle/right_finger')
+GRIPPER_DRIVE = '/World/xarm5/Physics/drive_joint'
 RIM_Z = 0.064                   # top of the bins: under it their walls hold a piece
 PARK = (3.0, 3.0, -0.98)        # on the ground, far from everything
 SETTLE_FRAMES = 150             # after Play, for the pieces to come to rest
@@ -233,6 +235,13 @@ while ctx.get_stage_loading_status()[2] > 0:
 for _ in range(50):
     app.update()
 stage = ctx.get_stage()
+if not CONFIG['belt'] and stage.GetPrimAtPath('/World/Conveyor'):
+    with Usd.EditContext(stage, stage.GetSessionLayer()):       # in memory: without it the belt drops pieces on any run
+        stage.GetPrimAtPath('/World/Conveyor').GetAttribute('omni:scripting:scripts').Set(Sdf.AssetPathArray([]))
+if CONFIG.get('grip_torque'):
+    with Usd.EditContext(stage, stage.GetSessionLayer()):       # for this batch only, world.usd stays as it is
+        stage.GetPrimAtPath(GRIPPER_DRIVE).GetAttribute('drive:angular:physics:maxForce').Set(float(CONFIG['grip_torque']))
+print('gripper motor:', stage.GetPrimAtPath(GRIPPER_DRIVE).GetAttribute('drive:angular:physics:maxForce').Get(), 'N*m', flush=True)
 add_copies(stage)
 pieces = {p.GetName(): Piece(p) for p in stage.GetPrimAtPath(PIECES_PATH).GetChildren()}
 active = []

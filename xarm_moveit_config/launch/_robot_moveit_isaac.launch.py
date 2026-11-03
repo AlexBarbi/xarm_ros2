@@ -34,6 +34,7 @@ ISAAC_DOCKER_DIR = '/xarm_isaac'
 ISAAC_DOCKER_SHARED_DIR = '/shared'
 # user of the Isaac Sim >= 5 containers (isaac-sim)
 ISAAC_DOCKER_UID = 1234
+SIMULATED_GRIP_GOAL_TOLERANCE = 0.03    # rad
 
 
 def add_topic_params(urdf_xml, joint_commands_topic, joint_states_topic):
@@ -110,6 +111,28 @@ def share_with_container(shared_dir):
     except (OSError, subprocess.CalledProcessError) as e:
         print('[WARN] isaac: cannot set ACLs on {} ({}), Isaac Sim may not be able to save there, '
               'try: chmod 777 {}'.format(shared_dir, e, shared_dir))
+
+
+def with_simulated_grip_tolerance(params_path):
+    """The same controller parameters, with the goal tolerance that holding a piece takes in simulation: the force of the
+    simulated gripper pushes the arm up to 0.03 rad off its goal (ARRIVAL_TOLERANCE of pick_and_place.py), and at the
+    0.01 rad of the real arm the controller aborts motions that have arrived. The file of the real arm stays as it is."""
+    with open(params_path, 'r') as f:
+        params = yaml.safe_load(f)
+
+    def loosen(node):
+        for key, value in node.items():
+            if key == 'constraints':
+                for joint in value.values():
+                    if isinstance(joint, dict) and 'goal' in joint:
+                        joint['goal'] = SIMULATED_GRIP_GOAL_TOLERANCE
+            elif isinstance(value, dict):
+                loosen(value)
+
+    loosen(params)
+    with tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False) as f:
+        yaml.dump(params, f)
+    return f.name
 
 
 def isaac_docker_cmd(image, bundle_dir, shared_dir, script_args, ros_distro, show_gui, extra_args):
@@ -210,6 +233,7 @@ def launch_setup(context, *args, **kwargs):
         use_sim_time=use_sim_time,
         robot_type=robot_type.perform(context)
     )
+    ros2_control_params = with_simulated_grip_tolerance(ros2_control_params)
 
     moveit_config = MoveItConfigsBuilder(
         context=context,
