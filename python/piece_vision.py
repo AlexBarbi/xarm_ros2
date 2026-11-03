@@ -12,6 +12,7 @@ fingers close along y of the base.
 
 import json
 import math
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -121,6 +122,29 @@ def resting_rotations(points, center_of_mass):
         if np.all(contour.equations[:, :2] @ center + contour.equations[:, 2] < -0.001):
             rotations.append(rotation)
     return rotations
+
+
+def mold_parts(models_path):
+    """{mold: its part numbers, sorted}, from the folder each CAD was found in by export_piece_models.py: Stampo <mold>."""
+    with open(models_path) as f:
+        models = json.load(f)
+    molds = {}
+    for number, model in models.items():
+        match = re.search(r'Stampo (\d+)', model['file'])
+        if match:
+            molds.setdefault(match.group(1), []).append(number)
+    return {mold: sorted(numbers) for mold, numbers in molds.items()}
+
+
+def mold_bins(models_path, mold, bin_count, reject_bin):
+    """Part number -> bin for a mold: its parts in the order of their numbers, into the bins other than reject_bin."""
+    parts = mold_parts(models_path)
+    if mold not in parts:
+        raise ValueError('mold {} unknown, the ones in {}: {}'.format(mold, models_path, ', '.join(sorted(parts))))
+    bins = [i for i in range(bin_count) if i != reject_bin]
+    if len(parts[mold]) > len(bins):
+        raise ValueError('mold {} has {} parts and there are {} bins for them'.format(mold, len(parts[mold]), len(bins)))
+    return dict(zip(parts[mold], bins))
 
 
 class PieceLibrary:

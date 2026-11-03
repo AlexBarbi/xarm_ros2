@@ -2,7 +2,25 @@
 
 `pick_and_place.py` svuota il tavolo di `shared/world.usd`: trova i pezzi con la camera di profondità sul polso, riconosce il codice (part number) di ognuno confrontandolo con il CAD, sceglie dove prenderlo e lo lascia cadere nel suo contenitore. Ripete finché sul tavolo non resta niente.
 
-Della posizione dei pezzi non c'è niente scritto nel codice. Sono fissi solo la posizione del tavolo e degli 11 contenitori (presi da `world.usd`) e la tabella `PIECE_BINS`, che dice in quale contenitore va ogni codice.
+Della posizione dei pezzi non c'è niente scritto nel codice. Sono fissi solo il tavolo, il nastro e i 4 contenitori, presi da `world.usd`.
+
+**Lo stampo.** Arrivano solo i pezzi di uno stampo alla volta, quello scritto in `shared/mold.txt`. Lo leggono sia il nastro, che fa cadere solo i suoi pezzi, sia il robot, che cerca solo quei codici: meno codici, meno scambi.
+
+| Stampo | Contenitore 0 | Contenitore 1 | Contenitore 2 |
+|---|---|---|---|
+| 940016506 | 47527 | 47531 | 56753 |
+| 940016509 | 47465 | 47481 | 53152 |
+| 940017355 | 49205 | 51189 | 52737 |
+| 940017433 | 57387 | 57388 | – |
+
+- I codici di uno stampo vanno nei contenitori 0, 1, 2 nell'ordine dei numeri. La tabella la ricava il programma dai CAD (`piece_models.json`, cartella "Stampo N"), quindi un nuovo stampo con i suoi CAD funziona senza cambiare il codice.
+- Il **contenitore 3 è degli scarti**: ci vanno i pezzi non riconosciuti che si possono prendere. Quelli senza una presa possibile restano sul nastro, e il giro dopo il nastro li porta oltre la fine.
+- **Cambiare stampo:** `pick_and_place.py --mold 940017355`, oppure scrivere il numero in `shared/mold.txt`. Il nastro lo rilegge a ogni giro, il robot a ogni giro di `--conveyor`.
+
+**Disposizione** (vista dall'alto, il robot guarda verso −x):
+
+- il nastro è centrato davanti al robot, y da −0,10 a 0,10, e si ferma a x −0,16;
+- i contenitori, interni 22×17 cm e profondi 12 cm, sono due per lato: 0 a (−0,20; 0,27), 1 a (−0,45; 0,27), 2 a (−0,20; −0,27), 3 a (−0,45; −0,27).
 
 | File | Cosa contiene |
 |---|---|
@@ -88,7 +106,7 @@ Il resto della macchia rimane sconosciuto: una volta tolto il pezzo alto, alla s
 ### 5. Altre viste
 
 - **Guardare più da vicino:** se resta qualcosa di sconosciuto, il braccio porta la camera sopra quel pezzo, al massimo a 0,5 m dalla base, e aggiunge la vista alla mappa. Fino a 3 volte per scansione, e smette se non migliora. Serve per i pezzi tagliati dal bordo dell'immagine o nascosti da altri.
-- **Guardarsi intorno:** la vista di scansione copre il 77% dell'area di lavoro. Prima di dichiarare il tavolo vuoto il braccio aggiunge due viste (`MORE_VIEWS`) e arriva al 93%.
+- **Guardarsi intorno:** la vista di scansione copre già tutta la zona di presa del nastro. Prima di dichiarare il nastro vuoto il braccio aggiunge due viste spostate lungo il nastro (`MORE_VIEWS`): quello che un pezzo alto nasconde da una, si vede dall'altra.
 
 ### 6. Scelta della presa
 
@@ -117,7 +135,7 @@ L'xArm5 ha 5 assi e raggiunge solo pose con la pinza **esattamente verticale**: 
 
 ### Il percorso più corto
 
-Tavolo e contenitori stanno dietro la base del robot. Con i limiti a ±178° il braccio doveva girare tutto davanti: 4,4–5,5 rad di `joint1` a ogni trasporto. Con i limiti aperti passa dietro la base, e ogni trasporto costa 1,2–2,3 rad.
+Con i limiti di `joint1` aperti il braccio sceglie sempre il verso di rotazione più corto verso il contenitore.
 
 `move_to` prova prima la **linea retta del TCP** (`/compute_cartesian_path`) e usa il planner OMPL solo se la retta non è fattibile, per esempio se è bloccata o passa troppo vicino alla base. Tre accorgimenti rendono affidabile la retta:
 
@@ -137,7 +155,7 @@ Un arrivo segnalato come fallito dal controller (`CONTROL_FAILED`) viene accetta
 4. **Chiusura** (`close_on`): vedi sotto.
 5. **Sollevamento.** La scatola del pezzo viene attaccata al TCP nella scena di MoveIt, così il planner lo tiene lontano da tavolo, contenitori e altri pezzi. Il pezzo sale in verticale finché il fondo è 15 mm sopra il bordo dei contenitori, o sopra il pezzo più alto rimasto sul tavolo.
 6. **Trasporto.** Il polso resta fermo e il pezzo ruota insieme al braccio: al contenitore non importa come cade. Il centro del pezzo va sopra il punto di rilascio, e lo scostamento tra TCP e centro del pezzo ruota anche lui.
-   - **Pezzi bassi** (sotto i 70 mm del bordo): al centro del contenitore.
+   - **Pezzi bassi** (sotto i 120 mm del bordo): al centro del contenitore.
    - **Pezzi alti:** in un angolo, a 37 mm dal centro su x e y. Prima gli angoli lontani dal lato da cui arriva il braccio, così non ci passa sopra. Al centro cadrebbero e resterebbero appoggiati fuori dal bordo; in un angolo possono cadere solo verso l'interno.
 7. **Rilascio.** Tutto si rilascia col fondo 15 mm sopra il bordo, anche i pezzi alti. Scendere di più porterebbe le dita sopra il bordo, e un dito che lo tocca mentre si apre fa esplodere la pinza simulata. Le dita si aprono di 0,3 rad e la scatola viene tolta dalla scena.
 
@@ -166,7 +184,7 @@ Per questo una perdita si decide solo **sopra il tavolo**:
 
 ## Scena di MoveIt
 
-- **Fissi:** il tavolo (una scatola con la superficie 5 mm sotto il piano, così non tocca la base del robot né i pezzi) e gli 11 contenitori (fondo e quattro pareti).
+- **Fissi:** il tavolo (una scatola con la superficie 5 mm sotto il piano, così non tocca la base del robot né i pezzi) e i 4 contenitori (fondo e quattro pareti).
 - **A ogni giro:** i pezzi trovati come scatole con 1 cm di margine. Quella del pezzo da prendere viene tolta prima di scendere, attaccata alla pinza durante il trasporto e rimossa al rilascio. Durante discesa e salita si tolgono anche le scatole dei pezzi entro 3 cm: lo spazio per le dita lo garantisce già la mappa delle altezze, mentre con il margine il pezzo in mano risultava già in collisione con il vicino e MoveIt rifiutava la salita (errore -10). Tornano nella scena appena finita la salita.
 - **All'avvio:** si tolgono i pezzi rimasti da un'esecuzione interrotta.
 
@@ -174,8 +192,8 @@ Per questo una perdita si decide solo **sopra il tavolo**:
 
 | Parametro | Valore | Cosa regola |
 |---|---|---|
-| `PIECE_BINS` | 11 codici → contenitori 0-10, 8 attivi | Quale codice va dove. È un'ipotesi: il foglio dice solo un codice per contenitore |
-| `SCAN_XYZ`, `MORE_VIEWS` | 1 + 2 viste a 0,397 m | Copertura dell'area di lavoro (77%, poi 93%) |
+| `MOLD_FILE`, `REJECT_BIN` | `shared/mold.txt`, 3 | Stampo in produzione, contenitore degli scarti |
+| `SCAN_XYZ`, `SCAN_YAW`, `MORE_VIEWS` | 1 + 2 viste a 0,397 m, pinza girata di −90° | La camera, 68 mm fuori dall'asse del TCP, sta sopra il centro della zona di presa con il lato lungo dell'immagine lungo il nastro |
 | `FREE_SPEED`, `CARRY_SPEED`, `LINEAR_SPEED` | 1.0, 1.0, 1.0 | Frazione dei limiti di velocità dei giunti; `ACCELERATION` 0.8 |
 | `LINE_STEP` | 5 mm | Passo dei punti della linea retta |
 | `CARRY_CLEARANCE` | 35 mm | Fondo del pezzo sopra bordi e pezzi durante il trasporto |
@@ -216,8 +234,7 @@ Prima del 3 novembre, con 3 codici e senza rumore: 10/10 sulla tua disposizione 
 - **Barrette in piedi.** Restano appoggiate negli angoli, con la cima sopra il bordo fino a circa 8 mm oltre la parete interna.
 - **47531 in piedi su uno spigolo** non ha una posa stabile nel CAD e viene preso per un 51189 in piedi (43×14×64 contro 42×20×68 mm).
 - **Pinza simulata.** Su prese strette il meccanismo a catena chiusa a volte si strappa e lancia il pezzo: 5 volte in una giornata con il motore a 5 N·m (45 N). Ora `world.usd` ha 2,2 N·m, cioè 20 N sul pezzo (un motore per due dita, leva 0,055 m): nessuna esplosione in 8 corse sulle stesse disposizioni, troppo poche per dirlo risolto. Per un'altra forza: `batch_test.py --grip-torque` per provarla, `shared/set_grip_torque.py` per salvarla in `world.usd`.
-- **Fondo del nastro.** Il quinto pezzo di un giro si ferma a x ≈ −0,62, dove la camera lo vede solo in parte: viene lasciato, segnalato, e preso al giro dopo.
-- **Mappatura.** In `PIECE_BINS` ci sono tutti gli 11 codici, 3 commentati (47527, 52737, 56753). L'assegnazione ai contenitori è da confermare. 47527 e 56753 sono quasi gemelli e si possono confondere.
+- **Stampo 940016506.** 47527 e 56753 sono quasi gemelli e si possono confondere: sono nello stesso stampo, quindi lo scambio resta.
 - **Posizioni fisse.** Tavolo e contenitori sono costanti prese da `world.usd`: se si spostano nella scena, vanno aggiornate nel codice.
 - **Percorso del CAD.** `MODELS` è relativo alla cartella da cui si lancia lo script (va lanciato da `ros_ws`).
 - **Sessione interattiva.** Lo script non è mai stato eseguito nella sessione di Isaac con interfaccia in streaming, che lì girava a circa 0,2 volte il tempo reale.

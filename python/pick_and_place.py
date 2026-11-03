@@ -4,8 +4,9 @@ Sort the pieces on the table of shared/world.usd into their bins with MoveIt 2, 
 (xArm5 + xArm gripper + RealSense, e.g. xarm5_moveit_isaac.launch.py).
 
 Nothing about the pieces is given: one depth image of the table is enough to find them, piece_vision.py recognizes
-each part number from the CAD (shared/piece_models.json) and works out where to hold it. PIECE_BINS says which bin
-each part number goes to. The table is scanned again until no piece is left on it.
+each part number from the CAD (shared/piece_models.json) and works out where to hold it. The pieces that come are the
+parts of one mold, the one written in shared/mold.txt (the belt reads it too): its part numbers go into bins 0, 1, 2 in
+the order of their numbers, unknown pieces into REJECT_BIN. The table is scanned again until no piece is left on it.
 
 The arm goes from point to point the shortest way: along the straight line when the IK can follow it, planned around
 what blocks it otherwise, and always with the fewest turns of the joints. The table and the bins are behind the base,
@@ -24,6 +25,7 @@ Usage:
   python3 pick_and_place.py --dry-run   # only scan, and print what is on the table and how it would be taken
   python3 pick_and_place.py --depth-topic /camera/aligned_depth_to_color/image_noisy   # with depth_noise.py running
   python3 pick_and_place.py --conveyor  # round after round: waits for the belt to stop, sorts, tells it to go on (Ctrl-C ends)
+  python3 pick_and_place.py --mold 940017355   # change the mold in production, for the robot and the belt
 """
 
 import argparse
@@ -57,22 +59,11 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from piece_vision import FINGER_MARGIN, MAX_GAP, PieceLibrary, TableMap, finger_position
+from piece_vision import FINGER_MARGIN, MAX_GAP, PieceLibrary, TableMap, finger_position, mold_bins
 
-# ---------------------------------------------------------------- what goes where: part number -> bin
-PIECE_BINS = {
-    '100000049205': 0,
-    '100000051189': 1,
-    '100000057387': 2,
-    '100000047465': 3,
-    '100000047481': 4,
-    # '100000047527': 5,
-    '100000047531': 6,
-    # '100000052737': 7,
-    '100000053152': 8,
-    # '100000056753': 9,
-    '100000057388': 10,
-}
+# ---------------------------------------------------------------- what goes where
+MOLD_FILE = os.environ.get('MOLD_FILE', 'shared/mold.txt')  # the mold in production: its parts are what comes on the belt
+REJECT_BIN = 3                      # unknown pieces that can be held go here, the parts of the mold into the other bins
 
 # ---------------------------------------------------------------- robot
 FRAME = 'link_base'                 # every position below is in this frame
@@ -115,18 +106,18 @@ TABLE_TOP_Z = -0.006                # surface the pieces and the bins stand on
 TABLE_SIZE = (0.8, 1.5, 0.03)
 TABLE_CENTER_XY = (-0.34, -0.2)
 
-# open bins: centers, inner size, outer height, wall/floor thickness
-BINS_XY = [(-0.12, 0.28), (-0.28, 0.28), (-0.44, 0.28), (-0.60, 0.28),
-           (-0.12, 0.44), (-0.28, 0.44), (-0.44, 0.44),                 # (-0.60, 0.44) is out of reach
-           (-0.12, 0.12), (-0.28, 0.12), (-0.44, 0.12), (-0.60, 0.12)]
+# open bins, two on each side of the belt: centers, inner size, outer height, wall/floor thickness
+BINS_XY = [(-0.20, 0.27), (-0.45, 0.27), (-0.20, -0.27), (-0.45, -0.27)]
 BIN_BOTTOM_Z = TABLE_TOP_Z
-BIN_INNER = (0.114, 0.114)          # x, y
-BIN_HEIGHT = 0.07
+BIN_INNER = (0.22, 0.17)            # x, y
+BIN_HEIGHT = 0.12
 BIN_WALL = 0.008
 
-# part of the table the camera looks for pieces in: up to the bins, without the base of the robot
-WORK_X = (-0.66, 0.0)
-WORK_Y = (-0.62, 0.04)
+# where the camera looks for pieces: the belt (x -1.70..-0.16, y -0.10..0.10 in world.usd) from a little further than the
+# arm reaches (-0.66), so that the last piece of a round is seen whole, and a little on its sides, up to the bins, without
+# the base of the robot
+WORK_X = (-0.74, -0.04)
+WORK_Y = (-0.165, 0.165)
 ROBOT_KEEP_OUT = (0.0, 0.0, 0.14)
 MODELS = 'shared/piece_models.json'
 BELT_FILE = 'shared/.conveyor_belt'     # what the belt of shared/conveyor_cycle.py is doing: moving, stopped or off
@@ -134,8 +125,11 @@ ROBOT_FILE = 'shared/.conveyor_robot'   # what this script is doing, for the bel
 BELT_SILENCE = 120.0                    # s of wall clock without a new round of the belt before saying what may be wrong
 
 # ---------------------------------------------------------------- motion
-SCAN_XYZ = (-0.377, -0.242, 0.397)  # TCP, gripper pointing down: the camera sees 77% of the work area from here
-MORE_VIEWS = [(-0.16, -0.32), (-0.44, -0.20)]   # x, y at the same height, 93% with these: a table is not empty before
+SCAN_XYZ = (-0.4525, 0.0675, 0.397)     # TCP, gripper pointing down and turned by SCAN_YAW: the camera (68 mm off the TCP,
+SCAN_YAW = -math.pi / 2                 # 0.55 m above the belt) is over the middle of the pick zone, at (-0.42, 0), and the
+                                        # long side of its image runs along the belt: it sees x -0.80..-0.04, y +-0.29
+MORE_VIEWS = [(-0.3325, 0.0675), (-0.5725, 0.0675)]     # TCP x, y of two more views along the belt, same height and yaw:
+                                                        # what a piece hides from one of them, the other sees
 LOOK_REACH = 0.5                    # m from the base: further than this the arm cannot look straight down from SCAN_XYZ's height
 MAX_LOOKS = 3                       # closer looks at what is not recognized, for each scan of the table
 FREE_SPEED = 1.0                    # fraction of the joint limits
@@ -197,7 +191,7 @@ class PieceDropped(RuntimeError):
 
 class PickAndPlace(Node):
 
-    def __init__(self, depth_topic=None):
+    def __init__(self, depth_topic=None, mold=None):
         super().__init__('pick_and_place')
         self.move_client = ActionClient(self, MoveGroup, 'move_action')
         self.execute_client = ActionClient(self, ExecuteTrajectory, 'execute_trajectory')
@@ -207,7 +201,10 @@ class PickAndPlace(Node):
         self.cartesian_client = self.create_client(GetCartesianPath, 'compute_cartesian_path')
         self.apply_scene_client = self.create_client(ApplyPlanningScene, 'apply_planning_scene')
         self.get_scene_client = self.create_client(GetPlanningScene, 'get_planning_scene')
-        self.library = PieceLibrary(MODELS, PIECE_BINS)
+        self.mold = None
+        self.piece_bins = {}                        # part number -> bin, of the mold
+        self.library = None
+        self.load_mold(mold)
         self.joints = {}
         self.joints_stamp = 0.0
         self.joint_limits = {}
@@ -236,6 +233,28 @@ class PickAndPlace(Node):
         self.spin_executor.shutdown()
         self.spin_thread.join(timeout=2.0)
         self.destroy_node()
+
+    def load_mold(self, mold=None):
+        """The mold in production, from MOLD_FILE, or the one given, which is written there for the belt."""
+        if mold:
+            temporary = Path(MOLD_FILE + '.tmp')
+            temporary.write_text(mold + '\n')
+            temporary.replace(MOLD_FILE)
+        else:
+            try:
+                mold = Path(MOLD_FILE).read_text().strip()
+            except OSError as e:
+                raise RuntimeError('no mold: {} ({}), give one with --mold'.format(MOLD_FILE, e))
+        if mold == self.mold:
+            return
+        try:
+            self.piece_bins = mold_bins(MODELS, mold, len(BINS_XY), REJECT_BIN)
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        self.library = PieceLibrary(MODELS, list(self.piece_bins))
+        self.mold = mold
+        self.get_logger().info('mold {}: {}, unknown pieces into bin {}'.format(
+            mold, ', '.join('{} into bin {}'.format(n, b) for n, b in self.piece_bins.items()), REJECT_BIN))
 
     def on_robot_description(self, msg):
         for joint in ET.fromstring(msg.data).iter('joint'):
@@ -441,7 +460,7 @@ class PickAndPlace(Node):
 
     def scan(self):
         """Look at the table from above and return its map."""
-        self.move_to(make_pose(*SCAN_XYZ, top_down(0.0)), 'scan', FREE_SPEED)
+        self.move_to(make_pose(*SCAN_XYZ, top_down(SCAN_YAW)), 'scan', FREE_SPEED)
         table = TableMap(TABLE_TOP_Z, WORK_X, WORK_Y, [ROBOT_KEEP_OUT])
         self.add_view(table)
         return table
@@ -450,7 +469,7 @@ class PickAndPlace(Node):
         """Add the views of the part of the table the first one does not cover."""
         for x, y in MORE_VIEWS:
             try:
-                self.move_to(make_pose(x, y, SCAN_XYZ[2], top_down(0.0)), 'look around', FREE_SPEED)
+                self.move_to(make_pose(x, y, SCAN_XYZ[2], top_down(SCAN_YAW)), 'look around', FREE_SPEED)
                 self.add_view(table)
             except RuntimeError as e:
                 self.get_logger().warn(str(e))
@@ -837,18 +856,17 @@ class PickAndPlace(Node):
             number, error = self.library.identify(piece)
             what = '{:.0f} x {:.0f} x {:.0f} mm at ({:.3f}, {:.3f})'.format(
                 piece.length * 1000, piece.width * 1000, piece.height * 1000, piece.center[0], piece.center[1])
-            if number is None:
-                self.get_logger().warn('unknown piece, {}: left on the table'.format(what))
-                continue
             if piece.partial:   # at the edge of what the camera reaches: a part of one piece can look like a whole other one
                 self.get_logger().warn('unknown piece, {}: only partly in view, left on the table'.format(what))
                 continue
+            name = number or 'unknown piece'
             grasp = table.grasp(piece, tried)
             if grasp is None:
-                self.get_logger().warn('{}, {}: no way to hold it, left on the table'.format(number, what))
+                self.get_logger().warn('{}, {}: no way to hold it, left on the table'.format(name, what))
                 continue
-            self.get_logger().info('{}, {}: bin {}, grasp ({:.3f}, {:.3f}, {:.3f}) yaw {:.0f} deg, {:.0f} mm wide'.format(
-                number, what, PIECE_BINS[number], grasp.x, grasp.y, grasp.z, math.degrees(grasp.yaw), grasp.width * 1000))
+            self.get_logger().info('{}, {}: {}, grasp ({:.3f}, {:.3f}, {:.3f}) yaw {:.0f} deg, {:.0f} mm wide'.format(
+                name, what, 'bin {}'.format(self.piece_bins[number]) if number else 'reject bin {}'.format(REJECT_BIN),
+                grasp.x, grasp.y, grasp.z, math.degrees(grasp.yaw), grasp.width * 1000))
             plans.append((piece, number, grasp))
         return plans, len(pieces)
 
@@ -864,9 +882,10 @@ class PickAndPlace(Node):
         self.add_objects(self.table_object(), *[self.bin_object(i) for i in range(len(BINS_XY))])
 
     def sort_pieces(self, dry_run=False):
-        """Clear the table: returns how many pieces went into the bins, and how many did not."""
+        """Clear the table: returns how many pieces went into their bins, into the reject bin, and how many are left."""
         start = time.monotonic()
         placed = 0
+        rejected = 0
         total = 0
         tried = []          # grasps that have been used: a piece still on the table did not work with them
         for round_number in range(MAX_ROUNDS + 1):
@@ -875,45 +894,57 @@ class PickAndPlace(Node):
             if dry_run or not plans:
                 self.look_around(table)
                 plans, on_table = self.recognize(table, tried)
-            total = max(total, placed + on_table)
+            total = max(total, placed + rejected + on_table)
             if dry_run or not plans or round_number == MAX_ROUNDS:
                 break
+            # The unknown ones only when nothing known is left: often two touching pieces, which come apart once the
+            # ones next to them are gone, and are known on the next look.
+            plans = [plan for plan in plans if plan[1]] or plans
             self.clear_pieces()
             self.add_objects(*[self.piece_object(piece, PIECE_MARGIN) for piece, _, _ in plans])
             plans.sort(key=lambda plan: -plan[0].height)   # the tall ones topple if something touches them
             for i, (piece, number, grasp) in enumerate(plans):
                 tallest_left = plans[i + 1][0].height if i + 1 < len(plans) else 0.0
+                bin_index = self.piece_bins[number] if number else REJECT_BIN
+                name = number or 'unknown piece'
                 dropped = False
                 for _ in range(GRASP_ATTEMPTS):
                     tried.append(grasp)
                     try:
-                        self.pick_and_drop(piece, grasp, PIECE_BINS[number], tallest_left, [p for p, _, _ in plans[i + 1:]])
-                        placed += 1
+                        self.pick_and_drop(piece, grasp, bin_index, tallest_left, [p for p, _, _ in plans[i + 1:]])
                         if piece.height > BIN_HEIGHT:
-                            self.tall_in_bin[PIECE_BINS[number]] += 1
+                            self.tall_in_bin[bin_index] += 1
                             self.bin_top = max(self.bin_top, BIN_WALL + piece.height)
-                        self.get_logger().info('{} placed, {:.1f} s since the start'.format(number, time.monotonic() - start))
+                        if number:
+                            placed += 1
+                            self.get_logger().info('{} placed, {:.1f} s since the start'.format(number, time.monotonic() - start))
+                        else:
+                            rejected += 1
+                            self.get_logger().info('unknown piece into the reject bin, {:.1f} s since the start'.format(
+                                time.monotonic() - start))
                         break
                     except PieceDropped as e:
-                        self.get_logger().warn('{}: {}'.format(number, e))
+                        self.get_logger().warn('{}: {}'.format(name, e))
                         dropped = True
                         break
                     except RuntimeError as e:
-                        self.get_logger().warn('{}: {}'.format(number, e))
+                        self.get_logger().warn('{}: {}'.format(name, e))
                     grasp = table.grasp(piece, tried)
                     if grasp is None:
                         break
                 if dropped:
                     break       # it can have landed anywhere, even on the next piece: look at the table again
         self.gripper(GRIPPER_OPEN, 'open')
-        missing = 0 if dry_run else max(total - placed - on_table, 0)
-        self.get_logger().info('done: {} dropped into the bins, {} on the table, {} lost, {:.1f} s'.format(
-            placed, on_table, missing, time.monotonic() - start))
-        return placed, on_table + missing
+        missing = 0 if dry_run else max(total - placed - rejected - on_table, 0)
+        self.get_logger().info('done: {} dropped into the bins, {} into the reject bin, {} on the table, {} lost, {:.1f} s'.format(
+            placed, rejected, on_table, missing, time.monotonic() - start))
+        return placed, rejected, on_table + missing
 
     def sort_table(self, dry_run):
+        """How many pieces did not go into their bins."""
         self.prepare()
-        return self.sort_pieces(dry_run)[1]
+        _, rejected, left = self.sort_pieces(dry_run)
+        return rejected + left
 
     def belt_says(self):
         try:
@@ -930,7 +961,7 @@ class PickAndPlace(Node):
     def follow_conveyor(self):
         """Round after round: a piece is never looked for on a moving belt, and the belt does not move under the robot."""
         self.prepare()
-        self.move_to(make_pose(*SCAN_XYZ, top_down(0.0)), 'scan', FREE_SPEED)
+        self.move_to(make_pose(*SCAN_XYZ, top_down(SCAN_YAW)), 'scan', FREE_SPEED)
         self.tell_belt('waiting')
         self.get_logger().info('waiting for the belt to stop')
         last = None                 # the number of the round, not the moving in between, which can pass unseen
@@ -953,10 +984,15 @@ class PickAndPlace(Node):
                 if belt[:1] == ['stopped'] and belt[1] != last:
                     last = belt[1]
                     rounds += 1
+                    self.load_mold()    # it can change between rounds
                     self.tell_belt('working', last)
                     self.get_logger().info('belt stopped, round {}'.format(last))
                     try:
-                        placed += self.sort_pieces()[0]
+                        done, _, left = self.sort_pieces()
+                        placed += done
+                        if left:
+                            self.get_logger().warn('round {}: {} pieces left that the robot cannot take, the belt carries '
+                                                   'what is still on it off its end'.format(last, left))
                     except RuntimeError as e:
                         self.get_logger().error('round {}: {}'.format(last, e))
                     self.tell_belt('done', last)
@@ -973,10 +1009,12 @@ def main():
     parser.add_argument('--depth-topic', help='depth image to use, e.g. the one of depth_noise.py (default: the topic ending '
                                               'in {})'.format(DEPTH_TOPIC))
     parser.add_argument('--conveyor', action='store_true', help='work with the belt round after round, until Ctrl-C')
+    parser.add_argument('--mold', help='the mold in production (e.g. 940016509): written into {} for the belt as well, which '
+                                       'otherwise says it'.format(MOLD_FILE))
     args = parser.parse_args(remove_ros_args(sys.argv)[1:])
 
     rclpy.init(args=sys.argv)
-    node = PickAndPlace(args.depth_topic)
+    node = PickAndPlace(args.depth_topic, args.mold)
     try:
         if args.conveyor:
             node.follow_conveyor()

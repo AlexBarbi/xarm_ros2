@@ -73,7 +73,16 @@ python3 src/xarm_ros2/python/pick_and_place.py                # smista quello ch
 python3 src/xarm_ros2/python/pick_and_place.py --conveyor     # segue il nastro giro dopo giro, fino a Ctrl-C
 ```
 
-All'avvio scrive cosa ha trovato: `gripper: …` e `camera: …`.
+All'avvio scrive cosa ha trovato: `gripper: …`, `camera: …` e lo stampo con i suoi contenitori.
+
+**Stampo.** Il nastro fa cadere solo i pezzi dello stampo scritto in `shared/mold.txt`, e il robot cerca solo quei codici. Per cambiarlo, anche mentre gira (vale dal giro dopo):
+
+```bash
+python3 src/xarm_ros2/python/pick_and_place.py --conveyor --mold 940017355
+echo 940017355 > shared/mold.txt                                   # oppure così
+```
+
+Stampi: 940016506, 940016509, 940017355, 940017433. I loro codici vanno nei contenitori 0, 1, 2; il 3 è degli scarti.
 
 Con il rumore della camera, in un quarto terminale:
 
@@ -117,7 +126,8 @@ Per fermarlo: `kill <pid>` oppure Ctrl-C se è in primo piano. I risultati racco
 | L'azione della pinza reale (sostituto) invece del controller | `--gripper driver` oppure `both` |
 | Un'altra forza della pinza | `--grip-torque 3.3` (N·m = N sul pezzo × 0,11; `world.usd` ha 2,2, cioè 20 N) |
 | Riprendere una sessione interrotta | `--out batch_results/<cartella>` (la stessa) |
-| Rifare corse precise | `--replay table:7590197 belt:48460314` (scenario:seed, li trovi nel report) |
+| Solo alcuni stampi | `--molds 940016509,940017433` (default: tutti, una corsa ciascuno a turno) |
+| Rifare corse precise | `--replay table:7590197:940016509 belt:48460314:940017433` (scenario:seed:stampo, colonna "Per rifarla" del report) |
 | Rifare il report dai dati | `--report batch_results/<cartella>` |
 
 I risultati vanno in `batch_results/<data_ora>/` e si aggiornano dopo ogni corsa:

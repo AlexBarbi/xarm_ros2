@@ -45,11 +45,12 @@ BELT_SPEED = 'physxSurfaceVelocity:surfaceVelocity'
 GRIPPER = '/World/xarm5/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link'
 FINGERS = (GRIPPER + '/left_outer_knuckle/left_finger', GRIPPER + '/right_outer_knuckle/right_finger')
 GRIPPER_DRIVE = '/World/xarm5/Physics/drive_joint'
-RIM_Z = 0.064                   # top of the bins: under it their walls hold a piece
+RIM_Z = CONFIG['rim_z']         # top of the bins: under it their walls hold a piece
 PARK = (3.0, 3.0, -0.98)        # on the ground, far from everything
 SETTLE_FRAMES = 150             # after Play, for the pieces to come to rest
 BELT_PIECES = 5                 # a round of the conveyor
-TOUCHING_SPOTS = [(-0.34, -0.34), (-0.22, -0.20), (-0.40, -0.14)]
+EDGE = 0.04                     # m kept free at the near end of the pick zone and along the sides of the belt
+FAR_X = -0.62                   # the far end of the pick zone, where a round of the belt leaves its last piece
 
 
 class Piece:
@@ -114,11 +115,19 @@ def extent(piece, orientation):
     return turned.min(axis=0), turned.max(axis=0)
 
 
-def choose(rng, count):
+def pick_zone(stage):
+    """(x0, x1, y0, y1) where pieces are laid: on the belt, wherever it is, in the part of it the camera looks at."""
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    belt = cache.ComputeWorldBound(stage.GetPrimAtPath(BELT)).ComputeAlignedRange()
+    return (max(belt.GetMin()[0] + EDGE, FAR_X), min(belt.GetMax()[0], CONFIG['work_x'][1]) - EDGE,
+            belt.GetMin()[1] + EDGE, belt.GetMax()[1] - EDGE)
+
+
+def choose(rng, count, codes):
     """count pieces, each code as likely as the others, as long as there are pieces of it left."""
     left = {}
     for name, piece in pieces.items():
-        if piece.number in CONFIG['codes']:
+        if piece.number in codes:
             left.setdefault(piece.number, []).append(name)
     chosen = []
     while len(chosen) < count and left:
@@ -129,14 +138,15 @@ def choose(rng, count):
     return chosen
 
 
-def lay_out(stage, scenario, seed, count):
+def lay_out(stage, scenario, seed, count, codes):
     rng = random.Random(seed)
     if scenario == 'scene':
-        chosen = [n for n in pieces if '/STP_' in pieces[n].path and pieces[n].number in CONFIG['codes']]
+        chosen = [n for n in pieces if '/STP_' in pieces[n].path and pieces[n].number in codes]
     elif scenario == 'belt':
         chosen = []
     else:
-        chosen = choose(rng, count)
+        chosen = choose(rng, count, codes)
+    x0, x1, y0, y1 = pick_zone(stage)
     for i, name in enumerate(sorted(set(pieces) - set(chosen))):
         place(stage, pieces[name], Gf.Quatd(1, 0, 0, 0), PARK[0] + i * 0.3, PARK[1], PARK[2])
     if scenario == 'scene':
@@ -148,7 +158,8 @@ def lay_out(stage, scenario, seed, count):
     taken = []
     free = list(chosen)
     if scenario == 'touching':
-        for cx, cy in TOUCHING_SPOTS[:len(chosen) // 2]:
+        spots = [(x0 + (x1 - x0) * (i + 0.5) / 3, y0 + 0.01) for i in range(3)]     # pairs across the belt
+        for cx, cy in spots[:len(chosen) // 2]:
             first, second = free.pop(), free.pop()
             lying = Gf.Quatd(math.cos(math.pi / 4), 0, math.sin(math.pi / 4), 0)
             lo, hi = extent(pieces[first], lying)
@@ -160,8 +171,7 @@ def lay_out(stage, scenario, seed, count):
             taken.extend([(cx, cy), (cx, y)])
     for name in free:
         for _ in range(2000):
-            r, a = rng.uniform(0.27, 0.56), math.radians(rng.uniform(-175, -95))
-            x, y = r * math.cos(a), r * math.sin(a)
+            x, y = rng.uniform(x0, x1), rng.uniform(y0, y1)
             if all(math.hypot(x - u, y - v) > 0.11 for u, v in taken):
                 break
         taken.append((x, y))
@@ -289,7 +299,7 @@ while app.is_running():
             for name in [n for n in pieces if n.startswith('Belt_')]:
                 del pieces[name]
             random.seed(message['seed'])        # the script of the conveyor draws from here
-            active = lay_out(stage, message['scenario'], message['seed'], message['count'])
+            active = lay_out(stage, message['scenario'], message['seed'], message['count'], message['codes'])
             app.update()
             timeline.play()
             waiting = {'id': message['id'], 'frames': SETTLE_FRAMES, 'belt': message['scenario'] == 'belt'}

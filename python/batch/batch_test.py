@@ -25,7 +25,8 @@ It is Isaac Sim, not the sorter: count those runs apart. With 5 N*m (45 N) there
 (20 N, now in world.usd) none in 8 runs on the same layouts: too few to call it fixed.
 
 Runs one sort at a time, without --conveyor: on the belt it starts when the belt has stopped, and the belt waits for it.
-Only the codes active in PIECE_BINS of pick_and_place.py are used, on the table and on the belt.
+Each run takes the parts of one mold, round and round the molds (--molds, all of shared/piece_models.json by default),
+on the belt and on the table alike: the sorter is told the mold in a mold.txt of its own, and so is the belt.
 
 Needs Isaac Sim in a container (--container) or installed here (--container '' --isaac-path), the workspace built, and
 ROS 2 sourced by --ros-setup. Everything else is found from where this file is. Nothing is saved in world.usd.
@@ -48,25 +49,26 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from piece_vision import mold_bins, mold_parts  # noqa: E402
 SCENARIOS = ('scene', 'table', 'tipped', 'touching', 'belt')
-RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'status', 'exit', 'pieces', 'ok', 'wrong_bin', 'on_table',
+RUN_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'status', 'exit', 'pieces', 'ok', 'wrong_bin', 'on_table',
               'lost', 'robot_s', 'wall_s', 'real_time_factor', 'in_window', 'drops', 'silent_failure', 'false_alarm',
               'straight_lines', 'around', 'moveit_errors']
-PIECE_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'piece', 'code', 'target_bin', 'outcome', 'where', 'said',
+PIECE_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'piece', 'code', 'target_bin', 'outcome', 'where', 'said',
                 'recognition', 'seen_mm', 'grasp_found', 'x', 'y', 'over_rim_mm']
 EVENT_FIELDS = ['run', 'scenario', 'noise', 'code', 'kind', 'count']
 MAX_JOINT4 = 3.2                # rad: past its stop it has torn loose, even if the fingers are still somewhere near
 MIN_FINGER = -0.1               # rad of drive_joint: the same, it stops at 0
 MAX_TRACKING = 0.5              # rad between where an arm joint is told to be and where it is, for half a second: the
                                 # gripper linkage tore and the arm with it (normal motions at full speed: 0.11)
-BIN_MARGIN = 0.058              # m from the center of a bin to its inner wall, plus 1 mm
-BIN_INNER = 0.057
+BIN_MARGIN = 0.001              # m past the inner wall of a bin that still counts as inside
 MATCH_DISTANCE = 0.07           # m between where the camera says a piece is and where it is
 LOG_LINE = re.compile(r'^\[\w+\] \[[\d.]+\] \[pick_and_place\]: (.*)$')
 SEEN = re.compile(r'^(?:(\d{12})|unknown piece), (\d+) x (\d+) x (\d+) mm at \((-?[\d.]+), (-?[\d.]+)\)(.*)$')
 CODE_EVENT = re.compile(r'^(\d{12}): (.*)$')
 PLACED = re.compile(r'^(\d{12}) placed,')
-DONE = re.compile(r'^done: (\d+) dropped into the bins, (\d+) on the table, (\d+) lost, ([\d.]+) s')
+DONE = re.compile(r'^done: (\d+) dropped into the bins, (?:\d+ into the reject bin, )?(\d+) on the table, (\d+) lost, ([\d.]+) s')
 EVENT_KINDS = (('slipped out', 'slip'), ('may have fallen', 'closed_in_transport'), ('lost during', 'lost_in_transport'),
                ('nothing between', 'empty_grasp'),
                ('MoveIt error', 'moveit_error'), ('no collision-free IK', 'no_ik'), ('folded', 'no_ik'))
@@ -94,12 +96,13 @@ def read_worst(path):
 
 
 def sorter_constants(path):
-    """PIECE_BINS and BINS_XY of pick_and_place.py, without importing it: it needs ROS."""
+    """The bins, the table and the work area of pick_and_place.py, without importing it: it needs ROS."""
     found = {}
     for node in ast.parse(Path(path).read_text()).body:
-        if isinstance(node, ast.Assign) and getattr(node.targets[0], 'id', '') in ('PIECE_BINS', 'BINS_XY'):
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], 'id', '') in (
+                'BINS_XY', 'BIN_INNER', 'BIN_HEIGHT', 'TABLE_TOP_Z', 'REJECT_BIN', 'WORK_X', 'WORK_Y'):
             found[node.targets[0].id] = ast.literal_eval(node.value)
-    return found['PIECE_BINS'], found['BINS_XY']
+    return found
 
 
 def parse_log(text):
@@ -143,28 +146,28 @@ def parse_log(text):
     return {'seen': seen, 'events': events, 'counts': counts, 'drops': drops, 'done': done}
 
 
-def where_is(piece, bins):
+def where_is(piece, bins, inner):
     """(where it is, how far over the walls it sticks out above the rim [mm]). It is in a bin if the walls hold it."""
     low, high = piece['low'], piece['high']
     if high[2] < -0.2:
         return 'floor', 0.0
     mean = piece['mean']
     below_low, below_high = piece['below_low'], piece['below_high']
+    mx, my = inner[0] / 2 + BIN_MARGIN, inner[1] / 2 + BIN_MARGIN
     for i, (x, y) in enumerate(bins):
         if below_low is None or low[2] < -0.003:
             break
-        inside = (below_low[0] > x - BIN_MARGIN and below_high[0] < x + BIN_MARGIN and
-                  below_low[1] > y - BIN_MARGIN and below_high[1] < y + BIN_MARGIN and
-                  abs(mean[0] - x) < BIN_MARGIN and abs(mean[1] - y) < BIN_MARGIN)
+        inside = (below_low[0] > x - mx and below_high[0] < x + mx and below_low[1] > y - my and below_high[1] < y + my and
+                  abs(mean[0] - x) < mx and abs(mean[1] - y) < my)
         if inside:
-            over = max(abs(low[0] - x), abs(high[0] - x), abs(low[1] - y), abs(high[1] - y)) - BIN_INNER
+            over = max(max(abs(low[0] - x), abs(high[0] - x)) - inner[0] / 2, max(abs(low[1] - y), abs(high[1] - y)) - inner[1] / 2)
             return 'bin {}'.format(i), max(over * 1000, 0.0)
     if -0.74 < mean[0] < 0.06 and -0.95 < mean[1] < 0.55 and -0.02 < low[2] < 0.05:
         return 'table', 0.0
     return 'elsewhere', 0.0
 
 
-def judge(start, end, log, bins, piece_bins):
+def judge(start, end, log, bins, inner, piece_bins):
     """One row for each piece: where it ended up against where it should, and whether it was recognized."""
     rows = []
     truth = []
@@ -178,7 +181,7 @@ def judge(start, end, log, bins, piece_bins):
     for t in truth:
         piece = end['pieces'].get(t['name'])
         target = piece_bins.get(t['code'], -1)
-        where, over = where_is(piece, bins) if piece else ('gone', 0.0)
+        where, over = where_is(piece, bins, inner) if piece else ('gone', 0.0)
         if where == 'bin {}'.format(target):
             outcome = 'ok'
         elif where.startswith('bin'):
@@ -251,8 +254,12 @@ def write_report(folder, command=''):
     clean = sum(r['ok'] == r['pieces'] and r['pieces'] != '0' for r in judged)
     robot = sum(float(r['robot_s']) for r in judged if r['robot_s'])
     wall = sum(float(r['wall_s']) for r in judged if r['wall_s'])
+    reject = sorter_constants(HERE.parent / 'pick_and_place.py')['REJECT_BIN']
+    rejected = sum(p['where'] == 'bin {}'.format(reject) for p in pieces)
     out += ['## In sintesi', '',
             '- **Pezzi nel contenitore giusto: {}**, {} su {}.'.format(rate(ok, len(pieces)), ok, len(pieces)),
+            '- Nel bin degli scarti ({}): {}. Il batch usa solo codici noti, quindi ognuno è un pezzo non riconosciuto, '
+            'contato tra i bin sbagliati.'.format(reject, rejected),
             '- Corse perfette: {}, {} su {}.'.format(rate(clean, len(judged)), clean, len(judged)),
             '- Tempo robot per pezzo: {:.1f} s simulati. Corse: {:.1f} ore reali in tutto.'.format(
                 robot / len(pieces) if pieces else 0.0, wall / 3600),
@@ -313,9 +320,9 @@ def write_report(folder, command=''):
     failed = [r for r in judged if r['ok'] != r['pieces'] or r['status'] != 'done']
     if failed:
         out += ['## Ultime corse non perfette', '']
-        out += table(['Corsa', 'Scenario', 'Rumore', 'Seed', 'Stato', 'A posto', 'Log'],
-                     [[r['run'], r['scenario'], r['noise'], r['seed'], r['status'], '{}/{}'.format(r['ok'], r['pieces']),
-                       'logs/{}.log'.format(r['run'])] for r in failed[-25:]])
+        out += table(['Corsa', 'Scenario', 'Rumore', 'Stampo', 'Per rifarla', 'Stato', 'A posto', 'Log'],
+                     [[r['run'], r['scenario'], r['noise'], r.get('mold', ''), '{}:{}:{}'.format(r['scenario'], r['seed'], r.get('mold', '')),
+                       r['status'], '{}/{}'.format(r['ok'], r['pieces']), 'logs/{}.log'.format(r['run'])] for r in failed[-25:]])
     text = '\n'.join(out)
     (folder / 'summary.md').write_text(text)
     return text
@@ -358,9 +365,10 @@ def process_group_alive(process):
 class Isaac:
     """Headless Isaac Sim, restarted when it hangs: its renderer does, after a while."""
 
-    def __init__(self, args, codes):
+    def __init__(self, args, codes, scene):
         self.args = args
         self.codes = codes
+        self.scene = scene                  # for batch_sim.py: where the bins end and the work area is
         self.shared = Path(args.workspace) / 'shared'
         name = '.batch_{}'.format(args.domain)
         self.state = self.shared / name
@@ -386,10 +394,10 @@ class Isaac:
         shutil.copy(HERE / 'batch_sim.py', self.state / 'batch_sim.py')
         root = Path(self.args.container_shared) if self.args.container else self.shared
         (self.state / 'config.json').write_text(json.dumps(
-            {'stage': str(root / self.args.stage), 'pool': self.args.pool, 'belt': belt, 'codes': sorted(self.codes),
-             'grip_torque': self.args.grip_torque}))
-        run = 'cd /tmp && ROS_DOMAIN_ID={} CONVEYOR_WAIT={} CONVEYOR_CODES={} {}/python.sh {}/batch_sim.py {} > {}/sim.log 2>&1'.format(
-            self.args.domain, self.conveyor_wait, ','.join(sorted(self.codes)), self.args.isaac_path, self.inside, self.inside, self.inside)
+            dict(self.scene, stage=str(root / self.args.stage), pool=self.args.pool, belt=belt, codes=sorted(self.codes),
+                 grip_torque=self.args.grip_torque)))
+        run = 'cd /tmp && ROS_DOMAIN_ID={} CONVEYOR_WAIT={} MOLD_FILE={}/mold.txt {}/python.sh {}/batch_sim.py {} > {}/sim.log 2>&1'.format(
+            self.args.domain, self.conveyor_wait, self.inside, self.args.isaac_path, self.inside, self.inside, self.inside)
         if self.args.container:
             subprocess.run(['docker', 'exec', '-d', self.args.container, 'bash', '-c', run], check=True)
         else:
@@ -448,9 +456,16 @@ class Batch:
         self.folder = Path(args.out)
         (self.folder / 'logs').mkdir(parents=True, exist_ok=True)
         self.python = HERE.parent
-        self.piece_bins, self.bins = sorter_constants(self.python / 'pick_and_place.py')
-        self.isaac = Isaac(args, self.piece_bins)
-        self.environment = dict(os.environ, ROS_DOMAIN_ID=str(args.domain), BATCH_WORKSPACE=args.workspace)
+        sorter = sorter_constants(self.python / 'pick_and_place.py')
+        self.bins, self.inner, self.reject = sorter['BINS_XY'], sorter['BIN_INNER'], sorter['REJECT_BIN']
+        self.models = Path(args.workspace) / 'shared' / 'piece_models.json'
+        parts = mold_parts(self.models)
+        self.molds = args.molds.split(',') if args.molds else sorted(parts)
+        self.mold_bins = {m: mold_bins(self.models, m, len(self.bins), self.reject) for m in self.molds}
+        codes = sorted(set(c for m in self.molds for c in self.mold_bins[m]))
+        self.isaac = Isaac(args, codes, {'rim_z': sorter['TABLE_TOP_Z'] + sorter['BIN_HEIGHT'], 'work_x': sorter['WORK_X']})
+        self.environment = dict(os.environ, ROS_DOMAIN_ID=str(args.domain), BATCH_WORKSPACE=args.workspace,
+                                MOLD_FILE=str(self.isaac.state / 'mold.txt'))     # the mold of the run, not the one in production
         self.source = 'source {} && source {}/install/setup.bash && '.format(args.ros_setup, args.workspace)
         self.done = set(r['run'] for r in read_rows(self.folder / 'runs.csv'))
         self.runs_since_start = 0
@@ -472,9 +487,9 @@ class Batch:
         index = 0
         for item in args.replay:
             index += 1
-            scenario, seed = item.split(':')
+            scenario, seed, mold = (item.split(':') + [self.molds[0]])[:3]
             yield {'run': 'r{:05d}_{}'.format(index, scenario), 'scenario': scenario, 'noise': args.noise[0],
-                   'gripper': args.gripper[0], 'seed': int(seed)}
+                   'gripper': args.gripper[0], 'seed': int(seed), 'mold': mold}
         if args.replay:
             return
         rng = random.Random(args.seed)
@@ -486,7 +501,7 @@ class Batch:
                             index += 1
                             seed = rng.randrange(1, 10 ** 8)
                             yield {'run': 'r{:05d}_{}'.format(index, scenario), 'scenario': scenario, 'noise': noise,
-                                   'gripper': gripper, 'seed': seed}
+                                   'gripper': gripper, 'seed': seed, 'mold': self.molds[index % len(self.molds)]}
 
     def start_moveit(self, run):
         log_path = self.folder / 'logs' / 'moveit.tmp'
@@ -513,7 +528,9 @@ class Batch:
             self.runs_since_start = 0
         self.runs_since_start += 1
         wait = self.args.belt_timeout if belt else 120.0
-        start = self.isaac.command(wait, cmd='reset', scenario=spec['scenario'], seed=spec['seed'], count=self.args.pieces)['snapshot']
+        (self.isaac.state / 'mold.txt').write_text(spec['mold'] + '\n')     # the belt and the sorter read it
+        start = self.isaac.command(wait, cmd='reset', scenario=spec['scenario'], seed=spec['seed'], count=self.args.pieces,
+                                   codes=sorted(self.mold_bins[spec['mold']]))['snapshot']
         if not start['pieces']:
             raise SystemExit('nessun pezzo nello scenario {}: scene usa quelli salvati in world.usd'.format(spec['scenario']))
         moveit, extras, sorter = None, [], None
@@ -564,7 +581,7 @@ class Batch:
 
     def record(self, spec, status, code, start, before, end, wall, log_path):
         log = parse_log(log_path.read_text(errors='replace'))
-        rows = judge(start, end, log, self.bins, self.piece_bins)
+        rows = judge(start, end, log, self.bins, self.inner, self.mold_bins[spec['mold']])
         tally = collections.Counter(r['outcome'] for r in rows)
         robot = end['t'] - before['t']
         window = ''
@@ -580,7 +597,7 @@ class Batch:
                       moveit_errors=log['counts']['moveit_errors'])
         self.append('runs', RUN_FIELDS, [result])
         self.append('pieces', PIECE_FIELDS, [dict(r, run=spec['run'], scenario=spec['scenario'], noise=spec['noise'],
-                                                  gripper=spec['gripper'], seed=spec['seed']) for r in rows])
+                                                  gripper=spec['gripper'], seed=spec['seed'], mold=spec['mold']) for r in rows])
         self.append('events', EVENT_FIELDS, [{'run': spec['run'], 'scenario': spec['scenario'], 'noise': spec['noise'], 'code': c,
                                               'kind': k, 'count': n} for (c, k), n in sorted(log['events'].items())])
         if all_ok and status == 'done' and self.kept_logs >= self.args.keep_logs:
@@ -595,7 +612,8 @@ class Batch:
         args = self.args
         begun = time.monotonic()
         finished = 0
-        print('Risultati in {}\nCodici attivi in PIECE_BINS: {}'.format(self.folder, len(self.piece_bins)), flush=True)
+        print('Risultati in {}\nStampi: {}'.format(self.folder, ', '.join(
+            '{} ({})'.format(m, ', '.join(c[-5:] for c in self.mold_bins[m])) for m in self.molds)), flush=True)
         for spec in self.specs():
             if spec['run'] in self.done:
                 finished += 1
@@ -639,7 +657,8 @@ def parse_arguments():
     parser.add_argument('--smoke', action='store_true', help='one run of each scenario, to see that it all works')
     parser.add_argument('--report', help='write the report of this folder again and exit')
     parser.add_argument('--out', help='results folder, an existing one goes on from where it stopped')
-    parser.add_argument('--replay', nargs='+', default=[], metavar='SCENARIO:SEED', help='only these runs, e.g. the failed ones of a report')
+    parser.add_argument('--replay', nargs='+', default=[], metavar='SCENARIO:SEED:MOLD', help='only these runs, e.g. the failed ones of a report')
+    parser.add_argument('--molds', help='comma separated, e.g. 940016509,940017433 (default: all of them, one run each in turn)')
     parser.add_argument('--scenarios', default='table,tipped,touching,belt', help='any of ' + ','.join(SCENARIOS))
     parser.add_argument('--noise', default='0,1', help='strengths of depth_noise.py, 0 is the perfect camera')
     parser.add_argument('--gripper', default='sim', help='sim, driver (the action of the real arm over the simulated gripper), or both')

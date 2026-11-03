@@ -2,10 +2,11 @@
 
 Quello che leggono Isaac Sim (montato in `/workspace` nel container) e `python/pick_and_place.py`:
 
-- `world.usd`: scena con braccio, tavolo, 11 contenitori e nastro. Il robot è in `xarm5/`.
+- `world.usd`: scena con braccio, tavolo, nastro centrato e 4 contenitori. Il robot è in `xarm5/`.
 - `conveyor_cycle.py`: lo script del nastro, attaccato a `/World/Conveyor`.
 - `piece_models.json`: le forme dei pezzi per il riconoscimento, generate con `export_piece_models.py`.
 - `set_grip_torque.py`: cambia la forza della pinza in `world.usd`. Ora è 2,2 N·m, cioè 20 N sul pezzo.
+- `mold.txt`: lo stampo in produzione, letto dal nastro e dal robot.
 - `fastdds_udp.xml`: configurazione DDS per parlare con il container.
 
 Non sono nel repo, vanno copiati a mano:

@@ -1,7 +1,8 @@
 """
 Cycle of the conveyor of world.usd: it is attached to /World/Conveyor, starts with Play and ends with Stop.
 
-  PIECES random pieces fall on the far end of the belt, which takes them to the zone the robot reaches
+  PIECES random pieces fall on the far end of the belt, which takes them to the zone the robot reaches: parts of the
+  mold written in mold.txt next to the stage (or in $MOLD_FILE), read again at every round
   the belt stops there, and starts again after WAIT seconds, when pick_and_place.py --conveyor says it has finished,
   or without it as soon as there are no pieces left on the belt
 
@@ -32,16 +33,7 @@ PIECES_PATH = '/World/Pieces'
 BELT_FILE = '.conveyor_belt'    # what the belt is doing, for pick_and_place.py
 ROBOT_FILE = '.conveyor_robot'  # what pick_and_place.py is doing, for the belt
 
-CODES = [                       # the part numbers that fall: the active ones of PIECE_BINS in pick_and_place.py
-    '100000047465',
-    '100000047481',
-    '100000047531',
-    '100000049205',
-    '100000051189',
-    '100000053152',
-    '100000057387',
-    '100000057388',
-]
+MOLD_FILE = os.environ.get('MOLD_FILE', '')    # the mold in production; empty: mold.txt next to the stage
 PIECES = 5                      # for each round of the belt
 WAIT = float(os.environ.get('CONVEYOR_WAIT', 3.0))   # s stopped at least, the pieces left on the belt can make it longer
 MAX_WAIT = 300.0                # s stopped at most: a robot that died must not stop the line for ever
@@ -72,7 +64,8 @@ class ConveyorCycle(BehaviorScript):
         self.tell('off')
 
     def on_play(self):
-        self.files = self.piece_files()
+        self.mold, self.files = None, {}
+        self.choose_parts()
         # where the belt is now: it can be moved in the scene
         cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
         belt = cache.ComputeWorldBound(self.stage.GetPrimAtPath(BELT)).ComputeAlignedRange()
@@ -99,6 +92,7 @@ class ConveyorCycle(BehaviorScript):
                 if not self.may_go_on():
                     return                  # moving now would take the pieces from under the robot
                 carb.log_warn('conveyor: running')
+                self.choose_parts()
                 self.reset()
                 self.belt(SPEED)
                 self.tell('moving')
@@ -158,18 +152,31 @@ class ConveyorCycle(BehaviorScript):
     def belt(self, speed):
         self.stage.GetPrimAtPath(BELT).GetAttribute(SPEED_ATTRIBUTE).Set(Gf.Vec3f(speed, 0.0, 0.0))
 
-    def piece_files(self):
-        """One .usd for each part number, among the ones next to the stage (the way export_piece_models.py finds them)."""
+    def choose_parts(self):
+        """The parts of the mold in production, if it changed: one .usd for each part number, in the folder of the mold
+        next to the stage (Stampo <mold>, the way export_piece_models.py finds them)."""
+        try:
+            mold = (Path(MOLD_FILE) if MOLD_FILE else self.folder() / 'mold.txt').read_text().strip()
+        except OSError as e:
+            carb.log_warn('conveyor: no mold ({}), keeping {}'.format(e, self.mold))
+            return
+        if mold == self.mold:
+            return
         files = {}
-        for path in sorted(Path(self.stage.GetRootLayer().realPath).parent.rglob('*.usd')):
+        for path in sorted(self.folder().rglob('Stampo {}/**/*.usd'.format(mold))):
             match = re.search(r'STP_(\d{9,})_', path.name)
             if match:
                 files.setdefault(match.group(1), str(path))
-        codes = os.environ.get('CONVEYOR_CODES', ','.join(CODES)).split(',')
-        return {n: f for n, f in files.items() if n in codes}
+        if not files:
+            carb.log_warn('conveyor: no part of mold {} next to the stage, keeping {}'.format(mold, self.mold))
+            return
+        self.mold, self.files = mold, files
+        carb.log_warn('conveyor: mold {}, {}'.format(mold, ', '.join(sorted(files))))
 
     def drop(self):
         self.dropped += 1
+        if not self.files:
+            return
         number = random.choice(sorted(self.files))
         path = '{}/Belt_{}_{}'.format(PIECES_PATH, len(self.made), number)
         prim = self.stage.DefinePrim(path, 'Xform')
