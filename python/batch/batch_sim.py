@@ -42,9 +42,6 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics  # noqa: E402
 PIECES_PATH = '/World/Pieces'
 BELT = '/World/Conveyor/Belt'
 BELT_SPEED = 'physxSurfaceVelocity:surfaceVelocity'
-GRIPPER = '/World/xarm5/Geometry/link_base/link1/link2/link3/link4/link5/link_eef/xarm_gripper_base_link'
-FINGERS = (GRIPPER + '/left_outer_knuckle/left_finger', GRIPPER + '/right_outer_knuckle/right_finger')
-GRIPPER_DRIVE = '/World/xarm5/Physics/drive_joint'
 BINS_PATH = '/World/Bins'
 PARK = (3.0, 3.0, -0.98)        # on the ground, far from everything
 SETTLE_FRAMES = 150             # after Play, for the pieces to come to rest
@@ -238,6 +235,16 @@ def snapshot(stage):
     return out
 
 
+def robot_part(stage, name, kind=None):
+    """The prim of this name in the robot, the rigid body if there are several: the robots of world.usd and
+    world_xarm6.usd have the same parts in different places."""
+    found = [p for p in stage.Traverse() if p.GetName() == name and (kind is None or p.IsA(kind))]
+    if not found:
+        raise RuntimeError('no {} in {}'.format(name, CONFIG['stage']))
+    rigid = [p for p in found if p.HasAPI(UsdPhysics.RigidBodyAPI)]
+    return str((rigid or found)[0].GetPath())
+
+
 def reply(message_id, **fields):
     temporary = os.path.join(STATE, 'reply.tmp')
     with open(temporary, 'w') as f:
@@ -254,6 +261,9 @@ while ctx.get_stage_loading_status()[2] > 0:
 for _ in range(50):
     app.update()
 stage = ctx.get_stage()
+FINGERS = (robot_part(stage, 'left_finger'), robot_part(stage, 'right_finger'))
+GRIPPER_DRIVE = robot_part(stage, 'drive_joint', UsdPhysics.RevoluteJoint)
+print('fingers:', *FINGERS, flush=True)
 if not CONFIG['belt'] and stage.GetPrimAtPath('/World/Conveyor'):
     with Usd.EditContext(stage, stage.GetSessionLayer()):       # in memory: without it the belt drops pieces on any run
         stage.GetPrimAtPath('/World/Conveyor').GetAttribute('omni:scripting:scripts').Set(Sdf.AssetPathArray([]))

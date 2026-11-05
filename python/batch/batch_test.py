@@ -7,6 +7,7 @@ happened from the true positions of the pieces, not from what the script says ab
   python3 batch_test.py --hours 12              # as long as you want, Ctrl-C stops it and keeps everything
   python3 batch_test.py --report batch_results/20261102_1530    # the report again, from the data
   python3 batch_test.py --hours 2 --grip-torque 3.3 --out batch_results/torque_3.3   # another gripper force (30 N), to compare
+  python3 batch_test.py --smoke --robot xarm6   # the xArm6: world_xarm6.usd, xarm6_moveit_isaac.launch.py, pick_and_place6.py
 
 Results go in batch_results/<date>/, written after every run:
   summary.md    the report: rates overall, by scenario, by mold and for each code, the bins and how they were found,
@@ -63,7 +64,11 @@ PIECE_FIELDS = ['run', 'scenario', 'noise', 'gripper', 'seed', 'mold', 'piece', 
 EVENT_FIELDS = ['run', 'scenario', 'noise', 'code', 'kind', 'count']
 BIN_FIELDS = ['run', 'mold', 'bin', 'x', 'y', 'inner_x_mm', 'inner_y_mm', 'rim_mm', 'found', 'center_error_mm', 'size_error_mm',
               'rim_error_mm', 'use', 'pieces_in', 'pieces_right']
-MAX_JOINT4 = 3.2                # rad: past its stop it has torn loose, even if the fingers are still somewhere near
+# per robot (--robot): the launch of MoveIt, the stage in shared/ and the sorter in python/
+ROBOTS = {'xarm5': ('xarm5_moveit_isaac.launch.py', 'world.usd', 'pick_and_place.py'),
+          'xarm6': ('xarm6_moveit_isaac.launch.py', 'world_xarm6.usd', 'pick_and_place6.py')}
+MAX_WRIST = 3.2                 # rad of the joint bending the wrist: past its stop it has torn loose, even if the fingers
+                                # are still somewhere near
 MIN_FINGER = -0.1               # rad of drive_joint: the same, it stops at 0
 MAX_TRACKING = 0.5              # rad between where an arm joint is told to be and where it is, for half a second: the
                                 # gripper linkage tore and the arm with it (normal motions at full speed: 0.11)
@@ -579,7 +584,8 @@ class Batch:
         self.folder = Path(args.out)
         (self.folder / 'logs').mkdir(parents=True, exist_ok=True)
         self.python = HERE.parent
-        sorter = sorter_constants(self.python / 'pick_and_place.py')
+        self.launch, _, self.sorter = ROBOTS[args.robot]
+        sorter = sorter_constants(self.python / self.sorter)
         self.table_z = sorter['TABLE_TOP_Z']
         self.models = Path(args.workspace) / 'shared' / 'piece_models.json'
         parts = mold_parts(self.models)
@@ -633,8 +639,7 @@ class Batch:
     def start_moveit(self, run):
         log_path = self.folder / 'logs' / 'moveit.tmp'
         for attempt in range(self.args.stack_attempts):
-            process = start_process(self.source + 'exec ros2 launch xarm_moveit_config xarm5_moveit_isaac.launch.py '
-                                    'headless:=true', log_path, self.environment)
+            process = start_process(self.source + 'exec ros2 launch xarm_moveit_config {} headless:=true'.format(self.launch), log_path, self.environment)
             end = time.monotonic() + self.args.stack_timeout
             while time.monotonic() < end:
                 text = log_path.read_text(errors='replace')
@@ -682,7 +687,7 @@ class Batch:
             time.sleep(2.0)
             before = self.isaac.command(30.0, cmd='snapshot')['snapshot']
             began = time.monotonic()
-            sorter = start_process(self.source + 'exec python3 {}/pick_and_place.py --web-port 0{}'.format(self.python, arguments),
+            sorter = start_process(self.source + 'exec python3 {}/{} --web-port 0{}'.format(self.python, self.sorter, arguments),
                                    log_path, self.environment)
             status = 'done'
             while sorter.poll() is None:
@@ -704,7 +709,7 @@ class Batch:
             stop_process(moveit)
         fingers = [abs(v) for finger in end['fingers'] for v in finger]
         worst = read_worst(watch_file)
-        if (not end['fingers'] or any(v != v or v > 2.0 for v in fingers) or worst.get('joint4', 0.0) > MAX_JOINT4 or
+        if (not end['fingers'] or any(v != v or v > 2.0 for v in fingers) or worst.get('wrist', 0.0) > MAX_WRIST or
                 worst.get('finger_min', 0.0) < MIN_FINGER or worst.get('tracking', 0.0) > MAX_TRACKING):
             status = 'exploded'
             self.isaac.running = None           # do not trust it for the next run
@@ -808,7 +813,8 @@ def parse_arguments():
     parser.add_argument('--seed', type=int, default=1, help='of the sequence of layouts: the same one gives the same runs')
     parser.add_argument('--belt-window', type=float, default=60.0, help='s of robot time a round of the belt should take')
     parser.add_argument('--workspace', default=str(HERE.parents[3]), help='ros_ws')
-    parser.add_argument('--stage', default='world.usd', help='in shared/')
+    parser.add_argument('--robot', default='xarm5', choices=sorted(ROBOTS), help='the arm, with its world, launch and sorter')
+    parser.add_argument('--stage', help='in shared/ (default: the world of --robot)')
     parser.add_argument('--ros-setup', default='/opt/ros/jazzy/setup.bash')
     parser.add_argument('--container', default='isaac-sim', help="of Isaac Sim, '' if it is installed on this machine")
     parser.add_argument('--container-shared', default='/workspace', help='where the container has shared/')
@@ -824,6 +830,7 @@ def parse_arguments():
     parser.add_argument('--run-attempts', type=int, default=3)
     parser.add_argument('--keep-logs', type=int, default=10, help='of runs that went well')
     args = parser.parse_args()
+    args.stage = args.stage or ROBOTS[args.robot][1]
     args.scenarios = args.scenarios.split(',')
     unknown = set(args.scenarios) - set(SCENARIOS)
     if unknown:
