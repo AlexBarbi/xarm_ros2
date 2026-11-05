@@ -4,7 +4,8 @@ What the sorter knows of its bins and what it is doing, and the web page that sh
 Board keeps, for each bin the robot found: what goes in it (a part number of the mold, the rejects, or nothing), its
 maximum, and the pieces that went in, saved in a file so that a restart keeps them. The robot asks it where a piece
 goes and waits on it when the bins for that piece are full; the page changes the mold, what each bin is for and its
-maximum, and says when a full bin has been changed for an empty one.
+maximum, and says when a full bin has been changed for an empty one. It also shows the pieces the last look saw on the
+belt, known or not, and the one the robot is taking on its way to its bin.
 
 The page is served by WebServer with the Python standard library only: http://<this PC>:8080, updated as things happen
 (server-sent events).
@@ -23,6 +24,7 @@ FREE = ''
 PART_MAX = 20                   # pieces in a bin of parts before it has to be changed, until the page says otherwise
 REJECT_MAX = 10                 # in the bin of the rejects: then the robot empties it on the belt
 SAME_BIN = 0.05                 # m between a bin found now and one of the saved file, to be the same
+SAME_PIECE = 0.002              # m between the piece of an action and one of the last look, to be the same
 
 
 class Board:
@@ -41,7 +43,8 @@ class Board:
         self.contents = []              # per bin: part numbers of what went in, 'unknown' for a reject
         self.waiting = None             # bins the robot waits for, to be changed
         self.status = 'avvio'
-        self.action = None              # code, from (x, y), to (bin), phase: pick, carry, drop
+        self.action = None              # code, from (x, y), to (bin), phase: pick, carry, drop; piece: its shape if seen
+        self.pieces = []                # what the last look saw on the belt: dicts center, length, width, angle, code, left
         self.saved = self.load()
         self.on_changed = None          # called with a bin when the page says it was changed (in Isaac: empty it)
         self.on_mold = None             # called with a mold chosen on the page
@@ -160,9 +163,23 @@ class Board:
             self.save()
             self.changed_now()
 
+    def set_pieces(self, pieces):
+        """What a look saw on the belt: (piece_vision.Piece, part number or None, True if the robot will take it)."""
+        with self.lock:
+            self.pieces = [{'center': [float(c) for c in p.center], 'length': float(p.length), 'width': float(p.width),
+                            'angle': float(p.angle), 'code': code, 'left': not taken} for p, code, taken in pieces]
+            self.changed_now()
+
+    def seen_at(self, center):
+        return [p for p in self.pieces if math.hypot(p['center'][0] - center[0], p['center'][1] - center[1]) < SAME_PIECE]
+
     def set_status(self, text, action=None):
         with self.lock:
             self.status = text
+            if action and action.get('from'):
+                seen = self.seen_at(action['from'])
+                if seen:
+                    action = dict(action, piece=seen[0])
             self.action = action
             self.changed_now()
 
@@ -170,6 +187,9 @@ class Board:
         with self.lock:
             if self.action:
                 self.action = dict(self.action, phase=phase)
+                if phase == 'carry':        # lifted: it is no longer on the belt, whether it gets to its bin or not
+                    seen = self.seen_at(self.action['from'])
+                    self.pieces = [p for p in self.pieces if p not in seen]
                 self.changed_now()
 
     # ------------------------------------------------------------ the page
@@ -212,6 +232,7 @@ class Board:
         with self.lock:
             return {'version': self.version, 'mold': self.mold, 'molds': self.molds, 'status': self.status,
                     'action': self.action, 'waiting': self.waiting, 'work_area': self.work_area, 'time': time.time(),
+                    'pieces': self.pieces,
                     'bins': [dict(b, index=i, use=self.use[i], max=self.max[i], contents=self.contents[i])
                              for i, b in enumerate(self.bins)]}
 

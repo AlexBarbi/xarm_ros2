@@ -1013,22 +1013,27 @@ class PickAndPlace(Node):
                 pieces = again
                 break               # nothing more to see from up here
             pieces = again
+        seen = []           # all of them, for the page: (piece, part number, whether it is taken)
         for piece in pieces:
             number, error = self.library.identify(piece)
             what = '{:.0f} x {:.0f} x {:.0f} mm at ({:.3f}, {:.3f})'.format(
                 piece.length * 1000, piece.width * 1000, piece.height * 1000, piece.center[0], piece.center[1])
             if piece.partial:   # at the edge of what the camera reaches: a part of one piece can look like a whole other one
                 self.get_logger().warn('unknown piece, {}: only partly in view, left on the table'.format(what))
+                seen.append((piece, None, False))
                 continue
             name = number or 'unknown piece'
             grasp = table.grasp(piece, tried)
             if grasp is None:
                 self.get_logger().warn('{}, {}: no way to hold it, left on the table'.format(name, what))
+                seen.append((piece, number, False))
                 continue
             self.get_logger().info('{}, {}: {}, grasp ({:.3f}, {:.3f}, {:.3f}) yaw {:.0f} deg, {:.0f} mm wide'.format(
                 name, what, self.bins_text(number),
                 grasp.x, grasp.y, grasp.z, math.degrees(grasp.yaw), grasp.width * 1000))
             plans.append((piece, number, grasp))
+            seen.append((piece, number, True))
+        self.board.set_pieces(seen)
         return plans, len(pieces)
 
     def prepare(self):
@@ -1176,6 +1181,7 @@ class PickAndPlace(Node):
                     except RuntimeError as e:
                         self.get_logger().error('round {}: {}'.format(last, e))
                     self.tell_belt('done', last)
+                    self.board.set_pieces([])      # the belt carries off what is left
                     self.board.set_status('giro {} finito, aspetta il nastro'.format(last))
                     self.get_logger().info('{} rounds, {} pieces dropped into the bins so far'.format(rounds, placed))
                     waiting_since = time.monotonic()

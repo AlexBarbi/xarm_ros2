@@ -44,10 +44,21 @@ svg { width: 100%; height: auto; display: block; }
 .bin .small { fill: var(--muted); font-size: 22px; }
 .robot { fill: var(--line); stroke: var(--bin-line); stroke-width: 4; }
 .route { stroke: var(--piece); stroke-width: 5; stroke-dasharray: 14 12; fill: none; }
-.piece { fill: var(--piece); stroke: var(--text); stroke-width: 3; transition: cx 1.5s ease-in-out, cy 1.5s ease-in-out, opacity .6s; }
-.piece.pick { animation: pulse 1s infinite; }
-@keyframes pulse { 50% { r: 26; } }
-.piece-label { fill: var(--text); font-size: 24px; font-weight: 600; }
+.part .shape { fill: var(--piece); stroke: var(--text); stroke-width: 3; }
+.part.unknown .shape { fill: color-mix(in srgb, var(--reject) 45%, var(--belt)); stroke-dasharray: 8 5; }
+.part.left { opacity: .45; }
+.piece-label { fill: var(--text); font-size: 22px; font-weight: 600; text-anchor: middle;
+               paint-order: stroke; stroke: var(--belt); stroke-width: 5px; }
+.hand { transition: transform 1.5s ease-in-out, opacity .6s; }
+.hand.gone { opacity: 0; }
+.hand .halo { fill: none; stroke: var(--piece); stroke-width: 5; opacity: 0; transform-box: fill-box; transform-origin: center; }
+.hand.pick .halo { animation: pulse 1.2s ease-out infinite; }
+@keyframes pulse { from { transform: scale(.5); opacity: .9; } to { transform: scale(1.6); opacity: 0; } }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 8px; color: var(--muted); font-size: 13px; }
+.legend i { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; border-radius: 2px;
+            border: 1.5px solid var(--text); background: var(--piece); }
+.legend i.unknown { background: color-mix(in srgb, var(--reject) 45%, var(--belt)); border-style: dashed; }
+.legend i.left { opacity: .45; }
 #cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; align-content: start; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
 .card.full { border-color: var(--warn); box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 40%, transparent); }
@@ -75,7 +86,11 @@ button { font: inherit; width: 100%; margin-top: 8px; padding: 7px; border-radiu
   <div id="error"></div>
 </header>
 <main>
-  <div class="panel"><svg id="view" viewBox="-620 -840 1240 980" role="img" aria-label="Vista dall'alto"></svg></div>
+  <div class="panel">
+    <svg id="view" viewBox="-620 -840 1240 980" role="img" aria-label="Vista dall'alto"><g id="scene"></g></svg>
+    <div class="legend"><span><i></i>riconosciuto</span><span><i class="unknown"></i>sconosciuto</span>
+      <span><i class="left"></i>lasciato sul nastro</span></div>
+  </div>
   <div id="cards"></div>
 </main>
 <script>
@@ -83,6 +98,8 @@ button { font: inherit; width: 100%; margin-top: 8px; padding: 7px; border-radiu
 const P = (x, y) => [y * 1000, x * 1000];
 const NS = 'http://www.w3.org/2000/svg';
 let state = null, layout = '';
+let hand = null;        // {key, g, moved}: the piece the robot is taking, kept from one drawing to the next so its animation goes on
+const turn = angle => Math.atan2(Math.cos(angle), Math.sin(angle)) * 180 / Math.PI;     // of a length axis, in the view
 
 function el(name, attrs, parent) {
   const e = document.createElementNS(NS, name);
@@ -106,8 +123,44 @@ function counts(list) {
   return Object.entries(c).map(([k, n]) => (k === 'unknown' ? 'sconosciuti' : k.slice(-5)) + ' ×' + n).join(', ');
 }
 
+function drawPiece(parent, p) {
+  // its smallest rectangle, and the part number over it, upright
+  const L = p.length * 1000, W = p.width * 1000, t = turn(p.angle) * Math.PI / 180;
+  el('rect', {class: 'shape', x: -L / 2, y: -W / 2, width: L, height: W, rx: 3, transform: `rotate(${turn(p.angle)})`}, parent);
+  const top = Math.abs(L / 2 * Math.sin(t)) + Math.abs(W / 2 * Math.cos(t));
+  el('text', {class: 'piece-label', y: -top - 8}, parent).textContent = p.code ? p.code.slice(-5) : '?';
+}
+
+function drawHand(svg, s) {
+  const a = s.action, bin = a && a.from && s.bins[a.to];
+  const key = bin ? a.from.join() + '>' + a.to : null;
+  if (hand && hand.key !== key) {
+    const g = hand.g;
+    g.classList.add('gone');
+    setTimeout(() => g.remove(), 600);
+    hand = null;
+  }
+  if (!key) return;
+  if (!hand) {
+    const p = a.piece || {length: 0.04, width: 0.04, angle: 0, code: a.code};
+    const [fx, fy] = P(a.from[0], a.from[1]);
+    const g = el('g', {class: 'hand part' + (p.code ? '' : ' unknown')}, svg);
+    g.style.transform = `translate(${fx}px, ${fy}px)`;
+    el('circle', {class: 'halo', r: Math.max(p.length, p.width) * 500 + 25}, g);
+    drawPiece(g, p);
+    hand = {key, g, moved: false};
+  }
+  hand.g.classList.toggle('pick', a.phase === 'pick');
+  if (a.phase !== 'pick' && !hand.moved) {
+    hand.g.getBoundingClientRect();     // where it starts, drawn first: or there is nothing to move it from
+    const [tx, ty] = P(bin.center[0], bin.center[1]);
+    hand.g.style.transform = `translate(${tx}px, ${ty}px)`;
+    hand.moved = true;
+  }
+}
+
 function drawView(s) {
-  const svg = document.getElementById('view');
+  const svg = document.getElementById('scene');
   svg.replaceChildren();
   const [x0, x1, y0, y1] = s.work_area;
   const [bx, by] = P(x0, y0), [bx2, by2] = P(x1, y1);
@@ -117,12 +170,11 @@ function drawView(s) {
   el('text', {class: 'belt-label', x: 0, y: 10, 'text-anchor': 'middle'}, svg).textContent = 'robot';
   for (const b of s.bins) {
     const [cx, cy] = P(b.center[0], b.center[1]);
-    const turn = Math.atan2(Math.cos(b.angle), Math.sin(b.angle)) * 180 / Math.PI;
     const full = b.contents.length >= b.max;
     const g = el('g', {class: 'bin' + (full ? ' full' : '') + (b.use === 'scarti' ? ' rejects' : ''),
                        transform: `translate(${cx} ${cy})`}, svg);
     const L = b.length * 1000, W = b.width * 1000;
-    const r = el('g', {transform: `rotate(${turn})`}, g);
+    const r = el('g', {transform: `rotate(${turn(b.angle)})`}, g);
     el('rect', {x: -L / 2, y: -W / 2, width: L, height: W, rx: 6}, r);
     const f = Math.min(b.contents.length / b.max, 1);
     el('rect', {class: 'fill', x: -L / 2 + 4, y: W / 2 - 4 - (W - 8) * f, width: L - 8, height: (W - 8) * f}, r);
@@ -130,15 +182,18 @@ function drawView(s) {
     el('text', {class: 'small', y: 26}, g).textContent = b.contents.length + ' / ' + b.max;
   }
   const a = s.action;
-  if (a && a.from && a.to !== undefined && s.bins[a.to]) {
+  if (a && a.from && s.bins[a.to]) {
     const [fx, fy] = P(a.from[0], a.from[1]);
     const [tx, ty] = P(s.bins[a.to].center[0], s.bins[a.to].center[1]);
     el('path', {class: 'route', d: `M${fx} ${fy} L${tx} ${ty}`}, svg);
-    const at = a.phase === 'pick' ? [fx, fy] : [tx, ty];
-    const dot = el('circle', {class: 'piece' + (a.phase === 'pick' ? ' pick' : ''), cx: fx, cy: fy, r: 20}, svg);
-    el('text', {class: 'piece-label', x: fx + 28, y: fy - 22}, svg).textContent = short(a.code || 'unknown');
-    if (a.phase !== 'pick') requestAnimationFrame(() => { dot.setAttribute('cx', at[0]); dot.setAttribute('cy', at[1]); });
   }
+  for (const p of s.pieces || []) {
+    if (a && a.from && Math.hypot(p.center[0] - a.from[0], p.center[1] - a.from[1]) < 0.002) continue;   // the hand draws it
+    const [px, py] = P(p.center[0], p.center[1]);
+    drawPiece(el('g', {class: 'part' + (p.code ? '' : ' unknown') + (p.left ? ' left' : ''),
+                       transform: `translate(${px} ${py})`}, svg), p);
+  }
+  drawHand(document.getElementById('view'), s);
 }
 
 function drawCards(s) {
