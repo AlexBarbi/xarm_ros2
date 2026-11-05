@@ -3,6 +3,7 @@
 Quello che leggono Isaac Sim (montato in `/workspace` nel container) e `python/pick_and_place.py`:
 
 - `world.usd`: scena con braccio, tavolo, nastro centrato e 6 casse (il programma le trova da solo all'avvio). Il robot è in `xarm5/`.
+- `world_xarm6.usd`: la stessa scena con l'xArm6 degli asset di Isaac Sim, che Isaac scarica dalla rete aprendola. Si rifà da `world.usd` con `build_world_xarm6.py` (comando in `python/COMANDI.md`, punto 5).
 - `conveyor_cycle.py`: lo script del nastro, attaccato a `/World/Conveyor`.
 - `piece_models.json`: le forme dei pezzi per il riconoscimento, generate con `export_piece_models.py`.
 - `set_grip_torque.py`: cambia la forza della pinza in `world.usd`. Ora è 2,2 N·m, cioè 20 N sul pezzo.

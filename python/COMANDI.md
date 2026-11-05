@@ -143,6 +143,7 @@ Per fermarlo: `kill <pid>` oppure Ctrl-C se è in primo piano. I risultati racco
 | Solo alcuni stampi | `--molds 940016509,940017433` (default: tutti, una corsa ciascuno a turno) |
 | Rifare corse precise | `--replay table:7590197:940016509 belt:48460314:940017433` (scenario:seed:stampo, colonna "Per rifarla" del report) |
 | Rifare il report dai dati | `--report batch_results/<cartella>` |
+| Con l'xArm6 | `--robot xarm6` (scena `world_xarm6.usd`, launch e smistatore del 6, vedi punto 5) |
 
 I risultati vanno in `batch_results/<data_ora>/` e si aggiornano dopo ogni corsa:
 
@@ -155,6 +156,27 @@ I risultati vanno in `batch_results/<data_ora>/` e si aggiornano dopo ogni corsa
 - `logs/`: i log delle corse fallite e delle prime riuscite.
 
 Le corse con stato **Simulazione esplosa** sono quelle in cui il meccanismo della pinza simulata si è strappato. È un problema di Isaac, non del programma: valutale a parte.
+
+## 5. xArm6
+
+La stessa scena con un xArm6 al posto dell'xArm5 è `shared/world_xarm6.usd`. Il robot è quello degli asset di Isaac Sim (`Isaac/Robots/Ufactory/xarm6/xarm6.usd`, con la pinza xArm): Isaac lo scarica quando apre la scena, in `shared/` non ce n'è una copia. Tavolo, nastro, casse, camera sul polso, forza della pinza e grafo ROS 2 sono quelli di `world.usd`.
+
+I comandi sono quelli dei punti 1–4, cambiano solo la scena, il launch e lo smistatore:
+
+```bash
+# Isaac Sim: come al punto 1, ma apri /workspace/world_xarm6.usd e premi Play
+ros2 launch xarm_moveit_config xarm6_moveit_isaac.launch.py            # MoveIt
+python3 src/xarm_ros2/python/pick_and_place6.py --conveyor             # smistatore, stesse opzioni di pick_and_place.py
+python3 src/xarm_ros2/python/batch/batch_test.py --smoke --robot xarm6 # batch
+```
+
+Cosa fa in più con il sesto asse è spiegato in fondo a [pick_and_place.md](pick_and_place.md).
+
+`world_xarm6.usd` è fatto a partire da `world.usd`. Se cambi `world.usd` (casse, nastro, forza della pinza), rifallo, con tutte e due le scene chiuse in Isaac:
+
+```bash
+docker exec isaac-sim bash -c "cd /tmp && /isaac-sim/python.sh /workspace/build_world_xarm6.py"
+```
 
 ## Se qualcosa non va
 
