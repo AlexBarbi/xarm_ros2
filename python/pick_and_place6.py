@@ -177,11 +177,15 @@ DUMP_GRIP_DEPTH = 0.03              # m of the wall between the fingers, from th
 DUMP_BOTTOM = 0.17                  # m of the bottom of a lifted bin above the table: over the other bins and the belt
 DUMP_AT = -0.40                     # x on the middle line of the belt where the pieces fall, in the middle of what the camera
                                     # sees: when the bin is turned along the belt; not turned, they fall in front of it
-DUMP_TURNS = (math.radians(135), math.radians(120))     # rolled this far, the first the arm can do: the wall the pieces
-                                    # slide out on is then 45 or 30 deg steep, and friction holds nothing
-DUMP_CLEARANCE = (0.02, 0.05, 0.09, 0.14)   # m of the bin, all the way round, over what lies highest on the belt: the
-                                    # least the arm can do, higher the wrist has more room
+DUMP_TURNS = (math.radians(135), math.radians(125), math.radians(120))  # rolled this far: the wall the pieces slide out
+                                    # on is then 45 to 30 deg steep, and friction holds nothing. Further, the gripper and
+                                    # the wrist go lower than the rim and the bin has to stay higher
+DUMP_FALL_STEP = 0.02               # m: falls this close count the same, and of those the farthest roll goes first
+DUMP_CLEARANCE = (0.02, 0.05, 0.09, 0.14)   # m of the bin, the gripper and the wrist, all the way round, over what
+                                    # lies highest on the belt: higher the arm has more room
 DUMP_STEP = math.radians(10)        # between the poses of the roll
+DUMP_SWEEP = 0.08                   # m the bin moves on while its pieces slide out, so that they do not land in a heap
+DUMP_SWEEP_FROM = math.radians(80)  # of the roll: from here the pieces start sliding
 DUMP_WRIST = ((0.172, 0.045), (0.27, 0.06))     # m up the gripper from the TCP, and m of room around: the gripper base
                                     # and the wrist, which go round with the bin and must stay over the belt as well
 DUMP_SPEED = 0.5                    # rolling the bin: the pieces slide out instead of being flung
@@ -693,7 +697,15 @@ class PickAndPlace(Node):
         request.max_velocity_scaling_factor = speed
         request.max_acceleration_scaling_factor = ACCELERATION
         response = self.call(self.cartesian_client, request, what)
-        return (response.fraction if response.error_code.val == MoveItErrorCodes.SUCCESS else 0.0), response.solution
+        times = [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in response.solution.joint_trajectory.points]
+        if response.error_code.val != MoveItErrorCodes.SUCCESS:
+            return 0.0, response.solution
+        if any(later <= earlier for earlier, later in zip(times, times[1:])):
+            # all of it followed, but the time parametrization of MoveIt failed on it and left every time at 0: the
+            # controller refuses that
+            self.get_logger().warn('{}: MoveIt could not time the straight line'.format(what))
+            return 0.0, response.solution
+        return response.fraction, response.solution
 
     def execute(self, path, what, check=None, tolerance=ARRIVAL_TOLERANCE):
         """Carry out a path of MoveIt, from where the arm really is now."""
@@ -1050,7 +1062,7 @@ class PickAndPlace(Node):
         pieces slide out over the opposite wall. All the way round, its lowest point stays just over what lies on the
         belt. Over the belt the bin hangs as it was taken, its pieces falling in front of where it stood, or turned along
         the belt, toward the robot or away from it. How far it rolls, how low and which way: the first one the arm can
-        follow, the farthest roll first, then the lowest."""
+        follow, of those the pieces fall from lowest the farthest roll first."""
         gx, gy, gz = grip
         center = np.array([found.center[0] - gx, found.center[1] - gy])
         into = center / np.linalg.norm(center)      # from the wall in the fingers into the bin
@@ -1061,42 +1073,50 @@ class PickAndPlace(Node):
                   for u in (-out_l, out_l) for v in (-out_w, out_w) for z in (TABLE_TOP_Z, TABLE_TOP_Z + found.rim)]
         points += [(np.array([0.0, 0.0, up]), room) for up, room in DUMP_WRIST]
         lip = np.array([2 * center[0], 2 * center[1], TABLE_TOP_Z + found.rim - gz])    # the rim the pieces slide over
-        upright = rotation(top_down(yaw))
         # which way the bin points over the belt, from the wall in the fingers, and x where its pieces fall
         ways = [(into, found.center[0]), (np.array([1.0, 0.0]), DUMP_AT), (np.array([-1.0, 0.0]), DUMP_AT)]
-        chosen = None
+        options = []
         for angle in DUMP_TURNS:
             steps = int(math.ceil(angle / DUMP_STEP))
-            for clearance in DUMP_CLEARANCE:
-                for way, fall_x in ways:
-                    turn = wrapped(math.atan2(way[1], way[0]) - math.atan2(into[1], into[0]))
-                    carried = Rotation.from_euler('z', turn)
-                    axis = np.array([-way[1], way[0], 0.0])     # up x way: along the wall in the fingers
-                    rolls = [Rotation.from_rotvec(axis * angle * k / steps) for k in range(steps + 1)]
-                    end = (rolls[-1] * carried).apply(lip)
-                    x, y = fall_x - end[0], -end[1]                  # the pieces fall on the middle line of the belt
-                    hanging = carried * upright
-                    poses = [make_pose(x, y, lift_z, quaternion(hanging))]  # over the belt first, as high as it was lifted
-                    for r in rolls:
-                        lowest = min((r * carried).apply(p)[2] - room for p, room in points)
-                        poses.append(make_pose(x, y, TABLE_TOP_Z + on_belt + clearance - lowest, quaternion(r * hanging)))
-                    fraction, path = self.cartesian(poses, 'roll the bin over', DUMP_SPEED)
-                    margin = self.limit_margin(path) if fraction >= LINE_DONE else 0.0
-                    way_text = '{:.0f} deg, {:.0f} mm over the belt, bin pointing {:.0f} deg'.format(
-                        math.degrees(angle), clearance * 1000, math.degrees(math.atan2(way[1], way[0])))
-                    if fraction >= LINE_DONE and margin >= DUMP_LIMIT_MARGIN:
-                        chosen = path
-                        break
-                    self.get_logger().info('roll {}: {:.0f}% of it possible, {:.2f} rad from the end of a joint'.format(
-                        way_text, fraction * 100, margin))
-                if chosen:
-                    break
-            if chosen:
+            for way, fall_x in ways:
+                turn = wrapped(math.atan2(way[1], way[0]) - math.atan2(into[1], into[0]))
+                carried = Rotation.from_euler('z', turn)
+                axis = np.array([-way[1], way[0], 0.0])         # up x way: along the wall in the fingers
+                rolls = [Rotation.from_rotvec(axis * angle * k / steps) for k in range(steps + 1)]
+                end = (rolls[-1] * carried).apply(lip)
+                x, y = fall_x - end[0], -end[1]                  # the pieces fall on the middle line of the belt
+                # while they slide out the bin moves on, toward where it rolls: they land along a line, not in a heap
+                moved = [[((r * carried).apply(p), room) for p, room in points] for r in rolls]
+                spots = []
+                for k in range(steps + 1):
+                    on = min(max((angle * k / steps - DUMP_SWEEP_FROM) / (angle - DUMP_SWEEP_FROM), 0.0), 1.0) - 0.5
+                    spots.append((x - way[0] * DUMP_SWEEP * on, y - way[1] * DUMP_SWEEP * on))
+                for clearance in DUMP_CLEARANCE:
+                    # the TCP as low as every point leaves room for, over what is under it: the belt and what lies on it,
+                    # or the table beside it, where the bin stood (the other bins are in the planning scene)
+                    heights = [TABLE_TOP_Z + clearance + max(self.floor_at(sx + q[0], sy + q[1], on_belt) + room - q[2]
+                                                             for q, room in pose) for pose, (sx, sy) in zip(moved, spots)]
+                    fall = heights[-1] + end[2] - (TABLE_TOP_Z + on_belt)  # of the rim they slide over, above the belt
+                    options.append((int(fall / DUMP_FALL_STEP), -angle, fall, clearance, way, spots, rolls, carried, heights))
+        options.sort(key=lambda option: option[:2])             # the lowest fall, and of those the farthest roll
+        hanging_from = rotation(top_down(yaw))
+        chosen = None
+        for _, minus_angle, fall, clearance, way, spots, rolls, carried, heights in options:
+            hanging = carried * hanging_from
+            poses = [make_pose(*spots[0], lift_z, quaternion(hanging))]     # over the belt first, as high as it was lifted
+            poses += [make_pose(*spot, z, quaternion(r * hanging)) for spot, r, z in zip(spots, rolls, heights)]
+            fraction, path = self.cartesian(poses, 'roll the bin over', DUMP_SPEED)
+            margin = self.limit_margin(path) if fraction >= LINE_DONE else 0.0
+            way_text = '{:.0f} deg, {:.0f} mm clear, bin pointing {:.0f} deg, the pieces sliding out {:.0f} mm over the belt'.format(
+                -math.degrees(minus_angle), clearance * 1000, math.degrees(math.atan2(way[1], way[0])), fall * 1000)
+            if fraction >= LINE_DONE and margin >= DUMP_LIMIT_MARGIN:
+                chosen = path
                 break
+            self.get_logger().info('roll {}: {:.0f}% of it possible, {:.2f} rad from the end of a joint'.format(
+                way_text, fraction * 100, margin))
         if not chosen:
             return False
-        self.get_logger().info('rolling the bin over: {}, the pieces sliding out {:.0f} mm over the belt'.format(
-            way_text, (clearance + (rolls[-1] * carried).apply(lip)[2] - lowest) * 1000))
+        self.get_logger().info('rolling the bin over: {}'.format(way_text))
         rolled = True
         try:
             self.execute(chosen, 'roll the bin over', tolerance=DUMP_ARRIVAL)
@@ -1115,6 +1135,11 @@ class PickAndPlace(Node):
             self.move_joints(dict(zip(start.joint_names, start.points[0].positions)), 'bin back over its place', CARRY_SPEED,
                              DUMP_ARRIVAL)
         return rolled
+
+    @staticmethod
+    def floor_at(x, y, on_belt):
+        """Height above the table of what is under (x, y), for a bin rolled over the belt."""
+        return on_belt if WORK_X[0] < x < WORK_X[1] and abs(y) < WORK_Y[1] else 0.0
 
     def limit_margin(self, path):
         """How close a path gets to the end of any joint [rad]."""
@@ -1139,7 +1164,9 @@ class PickAndPlace(Node):
                                      accelerations=list(p.accelerations), time_from_start=duration(stamp[reached] - t))
                 for p, t in zip(points[reached::-1], stamp[reached::-1])]
         back[0].positions = here
-        back[0].velocities = [0.0] * len(names)
+        for point in (back[0], back[-1]):       # still at both ends: the controller refuses a last point that is not
+            point.velocities = [0.0] * len(names)
+            point.accelerations = [0.0] * len(names)
         trajectory = RobotTrajectory(joint_trajectory=JointTrajectory(joint_names=list(names), points=back))
         result = self.run_action(self.execute_client, ExecuteTrajectory.Goal(trajectory=trajectory), what)
         self.check_arrival(result, dict(zip(names, back[-1].positions)), what, DUMP_ARRIVAL)

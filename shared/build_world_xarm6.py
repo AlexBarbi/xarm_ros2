@@ -3,8 +3,9 @@ everything else as it is (table, belt and its script, bins). Nothing is copied h
 assets, so Isaac Sim needs to reach them when it opens the stage. Inside the Isaac Sim container, with nothing open on
 world.usd:  /isaac-sim/python.sh /workspace/build_world_xarm6.py
 
-The robot gets what world.usd gives the xArm5 by hand: the drives of the joints (the 6 has one more in the wrist, it takes
-those of the others), the force of the gripper, the RealSense on the wrist where the URDF has it, and the ROS 2 graph of
+The robot gets what world.usd gives the xArm5: the drives of the joints (the 6 has one more in the wrist, it takes those
+of the others) with their motors and without the joint friction of the asset (1.0, which in PhysX goes with the force
+through the joint: the base did not turn at all), the force of the gripper, the RealSense on the wrist where the URDF has it, and the ROS 2 graph of
 joints, gripper, camera and clock, pointed at the new robot."""
 import os
 
@@ -24,7 +25,11 @@ OLD = '/World/xarm5'
 NEW = '/World/xarm6'
 DRIVE_ATTRIBUTES = ('drive:angular:physics:type', 'drive:angular:physics:stiffness', 'drive:angular:physics:damping',
                     'drive:angular:physics:targetPosition')
-GRIPPER_FORCE = 'drive:angular:physics:maxForce'
+MAX_FORCE = 'drive:angular:physics:maxForce'
+FRICTION = 'physxJoint:jointFriction'
+# the joint of the xArm5 whose motor each joint of the 6 gets: the 5 bends its wrist with joint4 and turns it with joint5,
+# the 6 turns its forearm with joint4, bends the wrist with joint5 and turns it with joint6
+MOTOR_OF = {'joint1': 'joint1', 'joint2': 'joint2', 'joint3': 'joint3', 'joint4': 'joint4', 'joint5': 'joint4', 'joint6': 'joint5'}
 
 
 def find(spec, name):
@@ -46,7 +51,10 @@ target.TransferContent(source)
 # what world.usd sets on the joints of the xArm5: the same on those of the 6
 arm_drive = {name: source.GetPrimAtPath(OLD + '/Physics/joint2').attributes[name].default for name in DRIVE_ATTRIBUTES}
 gripper = source.GetPrimAtPath(OLD + '/Physics/drive_joint')
-gripper_drive = {name: gripper.attributes[name].default for name in DRIVE_ATTRIBUTES + (GRIPPER_FORCE,)}
+gripper_drive = {name: gripper.attributes[name].default for name in DRIVE_ATTRIBUTES + (MAX_FORCE,)}
+old_stage = Usd.Stage.Open(SOURCE)     # the motors of the 5 come with its asset, not from world.usd
+motors = {p.GetName(): p.GetAttribute(MAX_FORCE).Get() for p in Usd.PrimRange(old_stage.GetPrimAtPath(OLD))
+          if p.IsA(UsdPhysics.RevoluteJoint) and p.GetName() in MOTOR_OF.values()}
 camera = find(source.GetPrimAtPath(OLD), 'RealSense')
 
 del target.GetPrimAtPath('/World').nameChildren[OLD.rsplit('/', 1)[1]]
@@ -76,7 +84,10 @@ print('RESULT articulation root', roots[0], flush=True)
 for joint in Usd.PrimRange(prim):
     if not joint.IsA(UsdPhysics.RevoluteJoint) or not joint.HasAPI(UsdPhysics.DriveAPI, 'angular'):
         continue                    # the fingers follow drive_joint as mimic joints
-    values = gripper_drive if joint.GetName() == 'drive_joint' else arm_drive
+    if joint.GetName() == 'drive_joint':
+        values = gripper_drive
+    else:
+        values = dict(arm_drive, **{MAX_FORCE: motors[MOTOR_OF[joint.GetName()]], FRICTION: 0.0})
     for name, value in values.items():
         attribute = joint.GetAttribute(name)
         if not attribute:

@@ -253,3 +253,46 @@ Prima del 3 novembre, con 3 codici e senza rumore: 10/10 sulla tua disposizione 
 - **Posizioni fisse.** Tavolo e nastro sono costanti prese da `world.usd`: se si spostano nella scena, vanno aggiornate nel codice. Le casse no.
 - **Percorso del CAD.** `MODELS` è relativo alla cartella da cui si lancia lo script (va lanciato da `ros_ws`).
 - **Sessione interattiva.** Lo script non è mai stato eseguito nella sessione di Isaac con interfaccia in streaming, che lì girava a circa 0,2 volte il tempo reale.
+
+## Versione xArm6 (`pick_and_place6.py`)
+
+`pick_and_place6.py` è lo stesso programma per un xArm6, sulla scena `shared/world_xarm6.usd` con `xarm6_moveit_isaac.launch.py`. Come lanciarlo: [COMANDI.md](COMANDI.md), punto 5. Visione, stampi, casse trovate all'avvio, pagina web, nastro e controllo della presa sono gli stessi. Cambia quello che il sesto asse permette: la pinza può puntare in qualsiasi direzione, non solo in verticale.
+
+**Il robot.** È l'xArm6 degli asset di Isaac Sim, con la pinza xArm, preso dalla rete all'apertura della scena. `shared/build_world_xarm6.py` costruisce `world_xarm6.usd` da `world.usd`:
+- toglie l'xArm5 e mette l'xArm6 nello stesso punto;
+- copia sui giunti i drive, i motori e la forza della pinza dell'xArm5, e toglie l'attrito dei giunti dell'asset (1,0: in PhysX va con la forza che passa nel giunto, e la base non girava proprio);
+- monta la RealSense sul polso come nell'URDF;
+- fa del braccio e della pinza un'unica articolazione e ci punta il grafo ROS 2.
+
+Le dita dell'asset seguono `drive_joint` con giunti *mimic* di PhysX, non con la catena chiusa dell'xArm5: il comportamento della presa va giudicato sulle prove di questo robot, non su quelle dell'xArm5.
+
+**Linee rette.** La pinza ruota in modo uniforme da dove è a dove va: niente partenza forzata in verticale e niente polso che insegue la base (punti 1 e 2 di "Il percorso più corto"). Di ogni soluzione IK si tengono `joint1`, `joint4` e `joint6` più vicini a dove sono, e tra le due prese equivalenti (mezzo giro) quella che muove meno il polso. Quando MoveIt segue tutta la retta ma non riesce a darle i tempi (succede, e il controller rifiuta una traiettoria con tutti i tempi a zero), la retta conta come non fattibile e si passa al planner.
+
+**Prese inclinate.** Un pezzo che il braccio non raggiunge dall'alto, in fondo al nastro, viene preso con la pinza inclinata di 15° o 30° verso la base, il meno possibile. Ruota attorno alla linea tra le dita, che quindi chiudono sul pezzo come dall'alto.
+- Il TCP sale di quanto scendono gli spigoli dei cuscinetti.
+- Se poi resta troppo poco pezzo tra le dita (meno di 5 mm), l'inclinazione non si usa.
+- Il pezzo va nella cassa inclinato allo stesso modo, quindi piatto com'era. Se lì il braccio non ci arriva, scende dall'alto, più in alto di quanto il pezzo pende.
+
+**Guardare più da vicino.** Un pezzo visto solo in parte e fuori portata dall'alto viene guardato da dove il braccio arriva, con la camera girata verso di lui (al massimo 40°), invece che dall'alto di un punto più vicino.
+
+**Svuotare la cassa degli scarti.** La cassa viene presa per la parete verso il nastro, alzata sopra tutto e rovesciata attorno a quella parete.
+- **Perché attorno alla parete.** Le dita la tengono ferma così. Attorno alla linea tra le dita invece scivola e gira (si è visto con l'xArm5).
+- **Il movimento.** La cassa scende sotto le dita e risale dall'altra parte. Pinza e polso girano con lei, e i pezzi scivolano fuori dalla parete opposta. Mentre escono (dagli 80° in poi) la cassa avanza di 8 cm, così i pezzi cadono in fila e non uno sull'altro: dall'alto si separano e si riconoscono meglio.
+- **Quanto in basso.** In ogni posa la cassa è più bassa possibile. Ogni suo spigolo, la pinza e il polso restano almeno 2 cm sopra quello che hanno sotto: la cosa più alta sul nastro, misurata prima con la camera, oppure il tavolo, dove la cassa stava. Le altre casse sono nella scena di MoveIt.
+- **Le combinazioni.** Il programma considera tre orientamenti sopra il nastro: com'era sul tavolo, girata verso il robot e girata dalla parte opposta. Per ciascuno, tre angoli (135°, 125°, 120°) e quattro margini (2, 5, 9 e 14 cm).
+  - Le ordina per l'altezza da cui i pezzi scivolano fuori. A parità, entro 2 cm, viene prima l'angolo più grande.
+  - Esegue la prima che MoveIt riesce a seguire tutta, restando a 0,1 rad dai fine corsa.
+  - A 135° pinza e polso scendono sotto il bordo e la cassa deve stare più alta, quindi di solito vince 125°: la parete su cui scivolano i pezzi è inclinata di 35°.
+- **Il ritorno.** Torna indietro sulla stessa traiettoria e rimette la cassa al suo posto.
+- **Se non ci riesce.** Se nessuna combinazione va, la cassa torna al suo posto piena e aspetta di essere cambiata dalla pagina web, come le altre.
+
+L'xArm5 invece può solo ribaltarla ruotando il polso, e la cassa sale di 20–30 cm.
+
+**Prove del 5 novembre** (rumore della camera a 1, stampi 940016509 e 940017433), `batch_results/xarm6_smoke5`: 17/20 nel contenitore giusto.
+- table, belt e tipped: 5/5 ciascuno.
+- rejects (5 pezzi buoni nella cassa degli scarti, che va svuotata): 2/5 e 5/5. In tutte e due le corse la cassa è stata rovesciata a 120° e rimessa a posto, e i pezzi sono usciti da circa 5 cm sopra il pezzo più alto sul nastro. I pezzi persi erano a contatto tra loro dopo la caduta: restano una macchia unica e finiscono di nuovo negli scarti.
+- Con l'xArm5, sulla stessa corsa rejects (seed 5): 3/5 col ribaltamento alto, 0/5 con la versione bassa poi tolta.
+
+Limiti visti:
+- Con lo stampo 940017355 la cassa degli scarti piena non viene trovata all'avvio. I 51189 in piedi dentro superano i 5 cm che la visione usa per le pareti, e la cassa non risulta chiusa. Vale anche per l'xArm5.
+- Dall'alto l'xArm6 arriva sul tavolo fino a x = −0,70. Inclinato di 15–30° arriva oltre −0,78, ma solo se la larghezza dei cuscinetti è lungo la direzione verso la base: inclinare di lato non aiuta. Nelle corse fatte la presa inclinata non è mai servita, perché i pezzi erano tutti a portata dall'alto.
