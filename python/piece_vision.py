@@ -265,15 +265,6 @@ class TableMap:
         self.view_count[known] += 1
         self.seen |= seen
 
-    def highest(self, x, y, radius):
-        """Height above the table of what is highest within radius of (x, y), noise left out."""
-        height = np.divide(self.views, self.view_count, out=np.zeros(self.shape), where=self.view_count > 0)
-        xs = self.x0 + (np.arange(self.shape[0]) + 0.5) * CELL
-        ys = self.y0 + (np.arange(self.shape[1]) + 0.5) * CELL
-        gx, gy = np.meshgrid(xs, ys, indexing='ij')
-        near = (np.hypot(gx - x, gy - y) < radius) & (self.view_count > 0)
-        return float(np.percentile(height[near], TOP_PERCENTILE)) if near.any() else 0.0
-
     def bins(self):
         """The open boxes in the map: areas closed all around by walls. Pieces are solid and the sides of the belt are
         open at its ends, so neither closes anything."""

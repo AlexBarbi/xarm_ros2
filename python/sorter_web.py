@@ -153,18 +153,10 @@ class Board:
             self.save()
             self.changed_now()
 
-    def moved(self, index, found):
-        """A bin the robot put back found where it really is now (piece_vision.Bin)."""
+    def emptied(self, index):
+        """The robot emptied this bin itself (the rejects, on the belt)."""
         with self.lock:
-            self.bins[index] = {'center': found.center, 'length': found.length, 'width': found.width, 'angle': found.angle,
-                                'rim': found.rim}
-            self.save()
-            self.changed_now()
-
-    def emptied(self, index, left=0):
-        """The robot emptied this bin itself (the rejects, on the belt), and saw left pieces still in it."""
-        with self.lock:
-            self.contents[index] = ['unknown'] * left
+            self.contents[index] = []
             self.save()
             self.changed_now()
 

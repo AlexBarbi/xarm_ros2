@@ -35,8 +35,6 @@ ISAAC_DOCKER_SHARED_DIR = '/shared'
 # user of the Isaac Sim >= 5 containers (isaac-sim)
 ISAAC_DOCKER_UID = 1234
 SIMULATED_GRIP_GOAL_TOLERANCE = 0.03    # rad
-SIMULATED_START_TOLERANCE = 0.1     # rad a trajectory may start off where the arm is: holding a bin the simulated arm
-                                    # sways and sags by more than the 0.01 rad of the real one, and every motion was refused
 
 
 def add_topic_params(urdf_xml, joint_commands_topic, joint_states_topic):
@@ -275,7 +273,6 @@ def launch_setup(context, *args, **kwargs):
         geometry_mesh_tcp_xyz=geometry_mesh_tcp_xyz,
         geometry_mesh_tcp_rpy=geometry_mesh_tcp_rpy,
     ).to_moveit_configs()
-    moveit_config.trajectory_execution['trajectory_execution.allowed_start_tolerance'] = SIMULATED_START_TOLERANCE
 
     urdf_xml, joint_commands_topics = add_topic_params(moveit_config.robot_description['robot_description'], joint_commands_topic, joint_states_topic)
     moveit_config.robot_description = {'robot_description': urdf_xml}

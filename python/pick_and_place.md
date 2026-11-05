@@ -28,14 +28,7 @@ Della posizione dei pezzi e delle casse non c'è niente scritto nel codice. Sono
 - Il robot conta i pezzi che mette in ogni cassa e di che codice sono, e lo salva in `shared/bins_state.json`, ritrovando le casse per posizione dopo un riavvio.
 - Dalla pagina si sceglie per ogni cassa cosa ci va (un codice dello stampo, scarti o niente) e il massimo. Più casse possono avere lo stesso codice: il robot riempie la prima e passa alla successiva.
 - Quando tutte le casse di un codice sono piene il robot si ferma e aspetta il pulsante **Cassa cambiata**. In Isaac quel pulsante svuota la cassa: lo fa lo script del nastro, leggendo `shared/.bins_changed`.
-- **Scarti pieni:** il robot svuota la cassa sul nastro.
-  - La prende per la parete più vicina al nastro, 3 cm sotto il bordo, la solleva sopra le altre casse e la porta sopra il centro del nastro.
-  - Prima gira il polso in modo che la parete presa stia di traverso al braccio: così la cassa ruota attorno alla parete, che le dita tengono ferma. Ruotandola attorno alla linea tra le dita, invece, scivolava e tornava giù storta di 20–40°.
-  - Guarda il nastro e la ruota fino a 126° attorno a un punto poco sopra le dita, tenendo la cassa, in tutta la rotazione, 3 cm sopra la cosa più alta che c'è sotto. In Isaac i pezzi cadono da circa 17 cm; ruotando solo il polso, come all'inizio, cadevano da circa 65 cm.
-  - Prova su MoveIt tutte le combinazioni: punto di rotazione a 5, 10 o 15 cm sopra le dita, i due versi, 126°, 109°, 100° o 92°. Sceglie quella che tiene la cassa più bassa e che resta almeno 0,1 rad lontana dai limiti dei giunti: più vicino, il peso della cassa spinge il polso oltre il limite e MoveIt non pianifica più. Con 5 assi la cassa può ruotare solo attorno all'asse orizzontale di traverso al braccio, e al massimo di 100–126° a seconda di come il braccio ci arriva.
-  - Se arriva a meno di 115°, scuote la cassa e poi la ruota di 126° col solo polso, più in alto, per quello che è rimasto.
-  - Torna indietro per la stessa strada, rimette la cassa dove l'aveva trovata, la ritrova con la camera (scena di MoveIt e pagina web aggiornate) e conta i pezzi rimasti dentro.
-  - Se nessuno dei pezzi rovesciati l'ultima volta è stato riconosciuto, alla volta dopo non la rovescia più e aspetta che venga cambiata, per non girare a vuoto.
+- **Scarti pieni:** il robot prende la cassa per la parete più vicina al nastro, 3 cm sotto il bordo, la solleva di 17 cm, la porta sopra il centro del nastro, la rovescia girando il polso (`joint4`), la rimette dove l'aveva trovata e guarda di nuovo il nastro. Se nessuno dei pezzi rovesciati l'ultima volta è stato riconosciuto, alla volta dopo non la rovescia più ma aspetta che venga cambiata, per non girare a vuoto.
 - In `world.usd` le casse sono corpi mobili da 120 g, così la pinza può sollevarle.
 
 **Disposizione in `world.usd`** (vista dall'alto, il robot guarda verso −x):
