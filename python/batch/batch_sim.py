@@ -218,6 +218,11 @@ def snapshot(stage):
         d = physx.get_rigidbody_transformation(path)
         if d['ret_val']:
             out['fingers'].append(list(d['position']))
+    out['bin_poses'] = {}                   # where the bins really are: the robot can lift one
+    for prim in stage.GetPrimAtPath(BINS_PATH).GetChildren():
+        d = physx.get_rigidbody_transformation(str(prim.GetPath()))
+        if d['ret_val']:
+            out['bin_poses'][prim.GetName()] = [list(d['position']), list(d['rotation'])]
     for name in active:
         piece = pieces[name]
         d = physx.get_rigidbody_transformation(piece.path)

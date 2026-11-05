@@ -48,6 +48,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.utilities import remove_ros_args
+from scipy import ndimage
 from scipy.spatial.transform import Rotation
 
 from builtin_interfaces.msg import Duration
@@ -55,14 +56,15 @@ from control_msgs.action import FollowJointTrajectory, GripperCommand
 from geometry_msgs.msg import Point, Pose, Quaternion
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (AttachedCollisionObject, CollisionObject, Constraints, JointConstraint, MoveItErrorCodes,
-                             PlanningScene, PlanningSceneComponents)
+                             PlanningScene, PlanningSceneComponents, RobotTrajectory)
 from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetPlanningScene, GetPositionFK, GetPositionIK
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
-from trajectory_msgs.msg import JointTrajectoryPoint
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from piece_vision import FINGER_MARGIN, MAX_GAP, PieceLibrary, TableMap, finger_position, mold_parts
+from piece_vision import (CELL, FINGER_MARGIN, MAX_GAP, MIN_PIECE_CELLS, MIN_PIECE_HEIGHT, PieceLibrary, TableMap,
+                          finger_position, mold_parts)
 from sorter_web import Board, WebServer, default_state_file
 
 # ---------------------------------------------------------------- what goes where
@@ -75,6 +77,7 @@ FRAME = 'link_base'                 # every position below is in this frame
 ARM_GROUP = 'xarm5'
 ARM_JOINTS = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5']
 TURNING_JOINTS = ['joint1', 'joint5']   # one full turn away is the same pose of the arm
+LIMIT_BACK = 0.05                   # rad inside the end of a joint the arm is taken back to, when a load pushed it past
 ARRIVAL_TOLERANCE = 0.03            # rad: the controller gives up at 0.01, and the grip force of the simulated gripper
                                     # alone pushes the wrist that far
 TCP_LINK = 'link_tcp'               # between the fingertips, 0.172 m from the gripper base
@@ -159,12 +162,30 @@ TRAVEL_CLEARANCE = 0.06             # TCP above the bin rims and what stands in 
 CARRY_CLEARANCE = 0.035             # bottom of a carried piece above the bin rims and the pieces on the table
 RELEASE_CLEARANCE = 0.015           # bottom of a piece above the rim of its bin when let go: from higher it bounces out
 BIN_CORNER_GAP = 0.02               # m from the inner walls of a bin to where a tall piece is dropped
+BIN_LOOK_MARGIN = 0.012             # m kept from the walls when counting the pieces in a bin: the walls are not pieces
+BIN_SEARCH = 0.08                   # m around where a bin was put back that it is looked for: it turns in the fingers
 # emptying the rejects on the belt: a bin is taken by the wall nearest to the belt, lifted over everything, tipped over
 # above the belt by turning the wrist (joint4), and put back where it was
 DUMP_GRIP_DEPTH = 0.03              # m of the wall between the fingers, from the rim down
 DUMP_BOTTOM = 0.17                  # m of the bottom of a lifted bin above the table: over the other bins and the belt
-DUMP_TURN = 2.2                     # rad of joint4 that tips a bin upside down, more or less
+DUMP_TURNS = (2.2, 1.9, 1.75, 1.6)  # rad a bin is turned to empty it, the first the arm can do: over the belt the
+                                    # tool turns 100-105 deg at most (joint4 starts near +1 and stops at +3.14), and a
+                                    # bin turned past 90 deg has its bottom leaning out
+DUMP_STEP = math.radians(10)        # between the poses of the turn
+DUMP_PIVOTS = (0.05, 0.10, 0.15)    # m over the TCP of the point the bin turns about, tried: about the fingers
+                                    # themselves the arm gets to 100-110 deg at most
+DUMP_CLEARANCE = 0.03               # m between the bin, all the way round, and what is highest on the belt under it
+DUMP_LOOK = 0.2                     # m around the middle of the belt where that is looked for
 DUMP_WAIT = 2.0                     # s of wall clock for what is in it to fall out
+DUMP_HIGH_TURN = 2.2                # rad of joint4 alone, after the low turn, for what is still in the bin: 126 deg, but
+                                    # the bin swings up about the wrist, 20-30 cm over the belt
+DUMP_SHAKES = 4                     # times the wrist shakes the turned bin: at 100 deg its pieces lie on a wall tilted
+DUMP_SHAKE = 0.25                   # rad of joint4 each way      only 10 deg, and friction holds them there
+DUMP_SHAKE_TIME = 0.25              # s of each swing
+DUMP_LIMIT_MARGIN = 0.1             # rad the turned arm, and its shaking, keep from the end of any joint: the bin sags
+                                    # the wrist past the end otherwise, and MoveIt then plans nothing from there (-26)
+DUMP_FULL = 2.0                     # rad of the low turn that empty the bin: from there no shaking, no high turn
+DUMP_ARRIVAL = 0.1                  # rad off its goal an arm holding a bin still counts as arrived: it sags under it
 PIECE_MARGIN = 0.01                 # around the pieces on the table, for the planner
 NEIGHBOR_GAP = 0.03                 # pieces closer than this to the one being taken: room for the fingers comes from the map
 PLANNING_TIME = 2.0
@@ -223,6 +244,7 @@ class PickAndPlace(Node):
         self.board.on_mold = self.mold_from_page
         self.board.on_changed = self.bin_changed
         self.recovered = None                       # pieces sorted since the rejects were last emptied on the belt
+        self.last_path = None                       # the last trajectory follow_poses carried out
         self.load_mold(mold)
         self.joints = {}
         self.joints_stamp = 0.0
@@ -582,7 +604,25 @@ class PickAndPlace(Node):
             what, pose.position.x, pose.position.y, pose.position.z))
         self.move_joints(self.compute_ik(pose, what), what, speed)
 
-    def move_joints(self, joints, what, speed):
+    def into_limits(self, what):
+        """The arm back inside the ends of its joints, straight to the controller: a load can push it a hair past them,
+        and MoveIt then plans nothing from there (-26)."""
+        names = list(ARM_JOINTS)
+        here = [self.joints[name] for name in names]
+        inside = []
+        for name, position in zip(names, here):
+            low, high = self.joint_limits.get(name, (-math.inf, math.inf))
+            inside.append(min(max(position, low + LIMIT_BACK), high - LIMIT_BACK))
+        if all(abs(a - b) < 1e-6 for a, b in zip(here, inside)):
+            return
+        self.get_logger().info('{}: the arm is at the end of a joint, back inside first'.format(what))
+        trajectory = RobotTrajectory(joint_trajectory=JointTrajectory(joint_names=names, points=[
+            JointTrajectoryPoint(positions=here, time_from_start=Duration()),
+            JointTrajectoryPoint(positions=inside, time_from_start=Duration(nanosec=500000000))]))
+        self.run_action(self.execute_client, ExecuteTrajectory.Goal(trajectory=trajectory), what)
+
+    def move_joints(self, joints, what, speed, tolerance=ARRIVAL_TOLERANCE):
+        self.into_limits(what)
         goal = MoveGroup.Goal()
         request = goal.request
         request.group_name = ARM_GROUP
@@ -605,11 +645,12 @@ class PickAndPlace(Node):
             result = self.run_action(self.move_client, goal, what, check=self.check_grip)
             if result.error_code.val not in (MoveItErrorCodes.INVALID_MOTION_PLAN, MoveItErrorCodes.PLANNING_FAILED):
                 break
-        self.check_arrival(result, joints, what)
+        self.last_path = result.planned_trajectory
+        self.check_arrival(result, joints, what, tolerance)
 
-    def check_arrival(self, result, joints, what):
+    def check_arrival(self, result, joints, what, tolerance=ARRIVAL_TOLERANCE):
         if result.error_code.val == MoveItErrorCodes.CONTROL_FAILED and all(
-                abs(self.joints[name] - position) < ARRIVAL_TOLERANCE for name, position in joints.items()):
+                abs(self.joints[name] - position) < tolerance for name, position in joints.items()):
             return
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
             raise RuntimeError('{}: MoveIt error {}'.format(what, result.error_code.val))
@@ -913,6 +954,7 @@ class PickAndPlace(Node):
         (gx, gy), normal = min(walls, key=lambda w: math.hypot(w[0][0] - belt_x, w[0][1] - belt_y))
         grip_z = TABLE_TOP_Z + found.rim - DUMP_GRIP_DEPTH
         lift_z = grip_z + DUMP_BOTTOM               # the whole bin goes up as much
+        belt_top = TABLE_TOP_Z + self.scan().highest(belt_x, belt_y, DUMP_LOOK)   # pieces lying there, or the belt
         travel = TABLE_TOP_Z + max(self.bin_rim(), self.bin_top) + TRAVEL_CLEARANCE
         yaw = self.closest_yaw(gx, gy, travel, normal + math.pi / 2)   # the fingers close across the wall
         q = top_down(yaw)
@@ -927,25 +969,16 @@ class PickAndPlace(Node):
             self.attach_object(obj)
             holding = True
             self.move_linear(make_pose(gx, gy, lift_z, q), 'lift the bin')
-            # the bin turns with the arm, like a piece (carry_to_bin): its middle over the middle of the belt
-            turn = wrapped(math.atan2(belt_y, belt_x) - math.atan2(found.center[1], found.center[0]))
+            # Its middle over the middle of the belt, turned so that the wall in the fingers lies across the reach of
+            # the arm: the bin then turns about that wall, which the fingers hold firm. Turned about the line between
+            # the fingers instead, it slips round in them (by 20-40 deg) and is put back askew.
+            usual = wrapped(math.atan2(belt_y, belt_x) - math.atan2(found.center[1], found.center[0]))
+            across = math.atan2(belt_y, belt_x) - normal
+            turn = min((wrapped(across), wrapped(across + math.pi)), key=lambda a: abs(wrapped(a - usual)))
             ox, oy = gx - found.center[0], gy - found.center[1]
             over = (belt_x + ox * math.cos(turn) - oy * math.sin(turn), belt_y + ox * math.sin(turn) + oy * math.cos(turn))
             self.move_to(make_pose(over[0], over[1], lift_z, top_down(yaw + turn)), 'bin over the belt', CARRY_SPEED)
-            upright = {j: self.joints[j] for j in ARM_JOINTS}
-            low, high = self.joint_limits.get('joint4', (-math.inf, math.inf))
-            tipped = False
-            for sign in (1, -1):
-                if low <= upright['joint4'] + sign * DUMP_TURN <= high:
-                    try:
-                        self.move_joints(dict(upright, joint4=upright['joint4'] + sign * DUMP_TURN), 'tip the bin over', CARRY_SPEED)
-                        tipped = True
-                        break
-                    except RuntimeError as e:
-                        self.get_logger().warn(str(e))
-            if tipped:
-                time.sleep(DUMP_WAIT)
-                self.move_joints(upright, 'turn the bin back', CARRY_SPEED)
+            tipped = self.pour(found, (gx, gy, grip_z), turn, over, yaw + turn, belt_top, lift_z)
             self.move_to(make_pose(gx, gy, lift_z, q), 'bin back over its place', CARRY_SPEED)
             self.move_linear(make_pose(gx, gy, grip_z + 0.003, q), 'put the bin down')
             if not tipped:
@@ -956,10 +989,235 @@ class PickAndPlace(Node):
                 self.detach_object(obj.id)
             self.add_objects(self.bin_object(index))
         self.move_linear(make_pose(gx, gy, travel, q), 'leave the bin')
-        self.board.emptied(index)
+        left = self.pieces_in_bin(index)
+        self.board.emptied(index, left)
         self.tall_in_bin[index] = 0
         self.recovered = 0
-        self.get_logger().info('bin {} emptied on the belt'.format(index))
+        self.get_logger().info('bin {} emptied on the belt, {} pieces still in it'.format(index, left))
+
+    def pour(self, found, grip, turn, over, yaw, belt_top, lift_z):
+        """Turn the bin held at grip upside down over the belt, about a point just over the fingers, as low as the bin
+        turning all the way round leaves room for. A 5-axis arm turns its tool only about the horizontal axis across its
+        own reach, so the bin turns that way, the pieces falling along the belt. Which way, about which point and how far
+        the arm can turn depends on where its joints are (joint4 stops at -1.69 and +3.14 rad): every way is tried on
+        MoveIt first, and the one that keeps the bin lowest is done. True if one could."""
+        gx, gy, gz = grip
+        c, s = math.cos(found.angle), math.sin(found.angle)
+        out_l, out_w = found.length / 2 + found.wall, found.width / 2 + found.wall
+        corners = []                                # of the bin, from the fingers, as it was taken
+        for u in (-out_l, out_l):
+            for v in (-out_w, out_w):
+                for z in (TABLE_TOP_Z, TABLE_TOP_Z + found.rim):
+                    x, y = found.center[0] + u * c - v * s, found.center[1] + u * s + v * c
+                    corners.append(np.array([x - gx, y - gy, z - gz]))
+        carried = Rotation.from_euler('z', turn)    # it turned with the arm on the way to the belt
+        reach = np.array([over[0], over[1], 0.0]) / math.hypot(over[0], over[1])
+        axis = np.cross([0.0, 0.0, 1.0], reach)     # horizontal, across the reach of the arm
+        upright = top_down(yaw)
+        start = Rotation.from_quat([upright.x, upright.y, upright.z, upright.w])
+        for angle in DUMP_TURNS:
+            options = []
+            steps = int(math.ceil(angle / DUMP_STEP))
+            for pivot in DUMP_PIVOTS:
+                for sign in (1, -1):
+                    turns = [Rotation.from_rotvec(axis * sign * angle * k / steps) for k in range(steps + 1)]
+                    tcp = [r.apply([0.0, 0.0, -pivot]) + [0.0, 0.0, pivot] for r in turns]     # from where it starts
+                    lowest = min(p[2] + (r * carried).apply(corner)[2] for r, p in zip(turns, tcp) for corner in corners)
+                    z = belt_top + DUMP_CLEARANCE - lowest
+                    way = '{:.0f} deg about {:.0f} mm, way {:+d}, TCP from {:.3f}'.format(math.degrees(angle), pivot * 1000, sign, z)
+                    if z > lift_z:
+                        self.get_logger().info('pour {}: higher than the bin was lifted'.format(way))
+                        continue                    # it would hit the belt before it is upside down
+                    poses = []
+                    for r, p in zip(turns, tcp):
+                        x, y, qz, w = (r * start).as_quat()
+                        poses.append(make_pose(over[0] + p[0], over[1] + p[1], z + p[2], Quaternion(x=x, y=y, z=qz, w=w)))
+                    # down and round in one go, from where the arm is: what is checked is what is done
+                    fraction, path = self.follow_poses(poses, 'turn the bin upside down', CARRY_SPEED, upright_start=True,
+                                                       execute=False)
+                    margin = self.limit_margin(path)
+                    self.get_logger().info('pour {}: {:.0f}%, {:.2f} rad from the end of a joint'.format(
+                        way, fraction * 100, margin))
+                    if fraction >= LINE_DONE and margin >= DUMP_LIMIT_MARGIN:
+                        options.append((z, pivot, sign, poses))
+            if options:
+                break
+        if not options:
+            self.get_logger().warn('the bin cannot be turned low over the belt, whichever way')
+            return self.tip_high()
+        z, pivot, sign, poses = min(options, key=lambda option: option[0])
+        self.get_logger().info('turning the bin {:.0f} deg about {:.0f} mm over the fingers, {} of {} ways possible'.format(
+            math.degrees(angle), pivot * 1000, len(options), 2 * len(DUMP_PIVOTS)))
+        over_joints = {j: self.joints[j] for j in ARM_JOINTS}     # to come back to, whatever happens
+        self.last_path = None
+        try:
+            tipped = self.follow_poses(poses, 'turn the bin upside down', CARRY_SPEED, upright_start=True,
+                                       tolerance=DUMP_ARRIVAL)
+        except RuntimeError as e:
+            self.get_logger().warn(str(e))
+            tipped = bool(self.last_path)       # it went somewhere: back the same way
+        if tipped:
+            if angle < DUMP_FULL:
+                try:
+                    self.shake()
+                except RuntimeError as e:
+                    self.get_logger().warn(str(e))
+            time.sleep(DUMP_WAIT)
+            # back the way it went, up again too: possible one way, it is the other. A new line from the turned bin
+            # has no IK as often as not (the wrist sags under the bin).
+            try:
+                self.retrace(self.last_path, 'turn the bin back', CARRY_SPEED)
+            except RuntimeError as e:
+                self.get_logger().warn(str(e))
+                self.move_joints(over_joints, 'bin up again', CARRY_SPEED)
+        else:
+            self.move_joints(over_joints, 'bin up again', CARRY_SPEED)
+        if tipped and angle >= DUMP_FULL:
+            return True
+        return self.tip_high() or tipped
+
+    def tip_high(self):
+        """What the low turn left in the bin: joint4 alone turns it to 126 deg, the bin swinging up about the wrist. True
+        if it could."""
+        here = {j: self.joints[j] for j in ARM_JOINTS}
+        low, high = self.joint_limits.get('joint4', (-math.inf, math.inf))
+        for sign in (1, -1):
+            target = here['joint4'] + sign * DUMP_HIGH_TURN
+            if not low + DUMP_LIMIT_MARGIN <= target <= high - DUMP_LIMIT_MARGIN:
+                continue
+            self.last_path = None
+            try:
+                self.move_joints(dict(here, joint4=target), 'turn the bin all the way', CARRY_SPEED, DUMP_ARRIVAL)
+            except RuntimeError as e:
+                self.get_logger().warn(str(e))
+                if not self.last_path or not self.last_path.joint_trajectory.points:
+                    continue                    # it did not move
+            time.sleep(DUMP_WAIT)
+            try:
+                self.retrace(self.last_path, 'turn the bin back', CARRY_SPEED)
+            except RuntimeError as e:
+                self.get_logger().warn(str(e))
+                self.move_joints(here, 'turn the bin back', CARRY_SPEED, DUMP_ARRIVAL)
+            return True
+        self.get_logger().warn('the bin cannot be turned all the way: joint4 has no room')
+        return False
+
+    def follow_poses(self, poses, what, speed, upright_start=False, start=None, execute=True, tolerance=ARRIVAL_TOLERANCE):
+        """Take the TCP through these poses, turning on the way, if the arm can follow all of it: True if it did. From
+        start (joints) if given, else from where the arm is; execute=False only asks MoveIt how much of it can be done."""
+        request = GetCartesianPath.Request()
+        request.header.frame_id = FRAME
+        start = dict(start) if start else {name: self.joints[name] for name in ARM_JOINTS}
+        if upright_start:
+            start['joint4'] = -(start['joint2'] + start['joint3'])     # from the tool exactly vertical, as follow_line
+        request.start_state.is_diff = True
+        request.start_state.joint_state.name = list(start)
+        request.start_state.joint_state.position = list(start.values())
+        request.group_name = ARM_GROUP
+        request.link_name = TCP_LINK
+        request.waypoints = poses
+        request.max_step = LINE_STEP
+        request.revolute_jump_threshold = MAX_LINE_STEP
+        request.avoid_collisions = True
+        request.max_velocity_scaling_factor = speed
+        request.max_acceleration_scaling_factor = ACCELERATION
+        response = self.call(self.cartesian_client, request, what)
+        if not execute:
+            return (response.fraction if response.error_code.val == MoveItErrorCodes.SUCCESS else 0.0), response.solution
+        if response.error_code.val != MoveItErrorCodes.SUCCESS or response.fraction < LINE_DONE:
+            self.get_logger().warn('{}: only {:.0f}% of it can be followed'.format(what, response.fraction * 100))
+            return False
+        trajectory = response.solution.joint_trajectory
+        trajectory.points[0].positions = [self.joints[name] for name in trajectory.joint_names]
+        self.last_path = response.solution
+        result = self.run_action(self.execute_client, ExecuteTrajectory.Goal(trajectory=response.solution), what)
+        self.check_arrival(result, dict(zip(trajectory.joint_names, trajectory.points[-1].positions)), what, tolerance)
+        return True
+
+    def limit_margin(self, path):
+        """How close a trajectory gets to the end of any joint [rad]."""
+        names = path.joint_trajectory.joint_names
+        margin = math.inf
+        for point in path.joint_trajectory.points:
+            for name, position in zip(names, point.positions):
+                low, high = self.joint_limits.get(name, (-math.inf, math.inf))
+                margin = min(margin, position - low, high - position)
+        return margin
+
+    def shake(self):
+        """Wrist to and fro, for the pieces lying in the turned bin to slide out of it. Straight to the controller: the
+        arm sagging under the bin can be out of what MoveIt plans from."""
+        names = list(ARM_JOINTS)
+        here = [self.joints[j] for j in names]
+        low, high = self.joint_limits.get('joint4', (-math.inf, math.inf))
+        wrist = names.index('joint4')
+        swings = [-DUMP_SHAKE, DUMP_SHAKE] * DUMP_SHAKES + [0.0]
+        points = [JointTrajectoryPoint(positions=here, time_from_start=Duration())]
+        for i, swing in enumerate(swings):
+            positions = list(here)
+            positions[wrist] = min(max(here[wrist] + swing, low + DUMP_LIMIT_MARGIN), high - DUMP_LIMIT_MARGIN)
+            t = (i + 1) * DUMP_SHAKE_TIME
+            points.append(JointTrajectoryPoint(positions=positions, time_from_start=Duration(sec=int(t), nanosec=int(t % 1 * 1e9))))
+        trajectory = RobotTrajectory(joint_trajectory=JointTrajectory(joint_names=names, points=points))
+        result = self.run_action(self.execute_client, ExecuteTrajectory.Goal(trajectory=trajectory), 'shake the bin')
+        try:
+            self.check_arrival(result, dict(zip(names, here)), 'shake the bin', DUMP_ARRIVAL)
+        except RuntimeError as e:
+            self.get_logger().warn(str(e))
+
+    def retrace(self, path, what, speed):
+        """Back along a trajectory the arm has just followed, from where it is now."""
+        points = path.joint_trajectory.points
+        total = points[-1].time_from_start.sec + points[-1].time_from_start.nanosec * 1e-9
+        back = []
+        for p in reversed(points):
+            t = total - (p.time_from_start.sec + p.time_from_start.nanosec * 1e-9)
+            back.append(JointTrajectoryPoint(positions=list(p.positions), velocities=[-v for v in p.velocities],
+                                             accelerations=list(p.accelerations),
+                                             time_from_start=Duration(sec=int(t), nanosec=int(t % 1 * 1e9))))
+        names = path.joint_trajectory.joint_names
+        back[0].positions = [self.joints[name] for name in names]
+        trajectory = RobotTrajectory(joint_trajectory=JointTrajectory(joint_names=list(names), points=back))
+        result = self.run_action(self.execute_client, ExecuteTrajectory.Goal(trajectory=trajectory), what)
+        self.check_arrival(result, dict(zip(names, back[-1].positions)), what, DUMP_ARRIVAL)
+
+    def pieces_in_bin(self, index):
+        """Find a bin the robot put back where it really is now (it can turn between the fingers), and count the pieces the
+        camera sees in it."""
+        old = self.bins[index]
+        x, y, yaw = min(SURVEY_VIEWS, key=lambda v: math.hypot(v[0] - old.center[0], v[1] - old.center[1]))
+        self.move_to(make_pose(x, y, SCAN_XYZ[2], top_down(yaw)), 'look into bin {}'.format(index), FREE_SPEED)
+        reach = max(old.length, old.width) / 2 + BIN_SEARCH
+        around = TableMap(TABLE_TOP_Z, (old.center[0] - reach, old.center[0] + reach),
+                          (old.center[1] - reach, old.center[1] + reach), [ROBOT_KEEP_OUT])
+        self.add_view(around)
+        near = [b for b in around.bins() if math.hypot(b.center[0] - old.center[0], b.center[1] - old.center[1]) < BIN_SEARCH]
+        if near:
+            found = near[0]
+            if math.hypot(found.center[0] - old.center[0], found.center[1] - old.center[1]) > 0.005 or abs(
+                    wrapped(2 * (found.angle - old.angle)) / 2) > math.radians(2):
+                self.get_logger().info('bin {} is now at ({:.3f}, {:.3f}), turned {:.0f} deg'.format(
+                    index, found.center[0], found.center[1], math.degrees(found.angle) % 180))
+            self.bins[index] = found
+            self.board.moved(index, found)
+        else:
+            self.get_logger().warn('bin {} not found again where it was put back: check it, its count starts from 0'.format(index))
+            return 0
+        self.remove_objects('{}{}'.format(BIN_PREFIX, index))
+        self.add_objects(self.bin_object(index))
+        # what stands inside its walls, over its floor, turned as it is
+        b = self.bins[index]
+        height = np.divide(around.views, around.view_count, out=np.zeros(around.shape), where=around.view_count > 0)
+        xs = around.x0 + (np.arange(around.shape[0]) + 0.5) * CELL
+        ys = around.y0 + (np.arange(around.shape[1]) + 0.5) * CELL
+        gx, gy = np.meshgrid(xs, ys, indexing='ij')
+        c, s = math.cos(b.angle), math.sin(b.angle)
+        u, v = (gx - b.center[0]) * c + (gy - b.center[1]) * s, -(gx - b.center[0]) * s + (gy - b.center[1]) * c
+        inside = (np.abs(u) < b.length / 2 - BIN_LOOK_MARGIN) & (np.abs(v) < b.width / 2 - BIN_LOOK_MARGIN)
+        pieces = inside & (height > b.wall + MIN_PIECE_HEIGHT)
+        labels, count = ndimage.label(ndimage.binary_opening(pieces, iterations=1))
+        sizes = np.bincount(labels.ravel())[1:]
+        return int((sizes >= MIN_PIECE_CELLS).sum())
 
     def find_bins(self):
         """How many bins there are, where and how large: looking from above at both sides of the belt and over it."""
